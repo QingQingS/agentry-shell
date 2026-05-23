@@ -321,4 +321,12 @@ def _resolve(self, path: str) -> Path:
 
 ---
 
-*下次会话继续：Step A（中性类型）✅、Step B（DeepSeek 工具路径）✅ 均已落地。工具层设计已定（第八节）。下一步：实现 core/tools.py（工具层 + ./wiki/ 沙箱）→ agents/wiki_agent.py（ReAct 循环，注意 reasoning_content 回传约束）。仍待讨论：SCHEMA.md 内容 + ReAct 循环兜底*
+### Step C 落地状态（2026-05-23）
+
+✅ Step C 已实现并验证。`core/tools.py`：Tool/FileTool 基类 + ReadFileTool/WriteFileTool/ListFilesTool + ToolRegistry（specs() / execute(call)→str，所有失败收敛为 observation 字符串）+ build_wiki_registry（冷启动种 index.md 骨架）。`SandboxViolation` 在 `_resolve` 抛、registry 边界转字符串。`tests/check_tools.py` 离线全绿，含三类沙箱攻击（路径穿越 `../`、绝对路径、符号链接逃逸）均挡住且越界操作未执行。grep 仍按计划推迟。
+
+注：`./wiki/` 目录在首次 ingest（或测试用临时目录）时才创建；是否纳入 git 由用户在 WikiAgent 跑起来后决定（是策展知识内容，未必算运行时产物）。
+
+---
+
+*下次会话继续：Step A（中性类型）✅、Step B（工具路径）✅、Step C（工具层+沙箱）✅ 均已落地。下一步 Step D：实现 agents/wiki_agent.py 的 ReAct 循环（用 ToolRegistry.specs() 喂 LLM、execute(call) 取 observation；**注意 reasoning_content 回传约束**；唯一停循环条件=无 tool_call 或 MAX_STEPS）。Step D 前需先讨论：SCHEMA.md 内容（wiki 维护规范/相关性打分/实体上限/新建 vs 更新）+ ReAct 循环兜底（反复写错/兜圈子）*

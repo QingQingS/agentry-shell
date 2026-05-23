@@ -14,7 +14,7 @@
 阶段一 ✅  基础架子：FastAPI + WebSocket + CLI + Web UI + AgentInterface
 阶段二 ✅  研究功能：LLM层 / Retriever层 / ResearchAgent / 流式输出 / Tavily / 多源并发
 阶段三 ✅  连续对话：session/intent/agent mode/orchestrator 全部实现，CLI 多轮 E2E 跑通（survey→chat→code_search，连续性+代词消解+落盘验证）。前端 B4 已修（追加式多轮历史），WS 单连接多轮已验证
-阶段四 🔨  WikiAgent（持久化 LLM 策展 Wiki，项目首个 agentic agent）——设计存档见 wiki-agent开发.md。BaseLLM tool calling 设计已定（讨论三，第七节）。✅ Step A（ToolSpec/ToolCall 中性类型 + ChatMessage/LLMResponse 字段扩展）已并入 master。下一步 ⏳ Step B（DeepSeek 工具路径）；并行待讨论：ReAct 循环边界 / SCHEMA.md / core/tools.py 沙箱
+阶段四 🔨  WikiAgent（持久化 LLM 策展 Wiki，项目首个 agentic agent）——设计存档见 wiki-agent开发.md（第七、八节）。✅ Step A 中性类型 / ✅ Step B DeepSeek 工具路径（含思考模型 reasoning_content 回传坑）/ ✅ Step C core/tools.py 工具层+./wiki/ 沙箱（3 工具+冷启动，沙箱挡穿越/绝对/符号链接）均已落地。下一步 ⏳ Step D agents/wiki_agent.py ReAct 循环（前置：先讨论 SCHEMA.md + 循环兜底）；之后 Step E 接入 Orchestrator（route=wiki）
 ```
 
 ---
