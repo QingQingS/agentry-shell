@@ -1,7 +1,7 @@
 [project]
-name = "agent-shell"
+name = "agentry-shell"
 version = "0.1.0"
-description = "可替换 Agent 的通用基础设施框架"
+description = "A from-scratch, extensible LLM agent runtime: agent lifecycle, intent-driven orchestration, and a ReAct tool loop."
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.110.0",
