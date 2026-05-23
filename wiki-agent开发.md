@@ -236,12 +236,70 @@ Anthropic 工具支持（若要）是独立后续步。
 
 - OpenAI 参数 JSON 可能畸形（LLM 偶发坏 JSON）：可恢复事件，provider 解析失败不 crash，best-effort `arguments={}` 并保留原始串，由 agent 循环决定回喂「参数无效」。放到 WikiAgent ReAct 那轮细化。
 
-### 仍未讨论清楚（下次接续）
+### Step A 落地状态（2026-05-23）
 
-- WikiAgent ReAct 循环边界：MAX_STEPS、何时停、LLM 写错文件/越界 ./wiki/ 的处理
-- SCHEMA.md 内容：给 LLM 的 wiki 维护操作规范怎么写
-- `core/tools.py` 工具层与 tool calling 的衔接（沙箱 ./wiki/）
+✅ Step A 已实现并合入 master（git 仓库于本日初始化，`.env` 已 gitignore）。中性类型 ToolSpec/ToolCall + ChatMessage/LLMResponse 字段扩展全部就位，离线测试全绿，纯文本路径无回归。下一步 Step B（DeepSeek 工具路径）。
 
 ---
 
-*下次会话继续：BaseLLM tool calling 三决策已定，可直接进 Step A 实现；或先讨论 WikiAgent ReAct 循环边界 + SCHEMA.md*
+## 八、core/tools.py 工具层 + ./wiki/ 沙箱（讨论四，2026-05-23 已定）
+
+4 个分叉全部按推荐拍板。
+
+### 1. 工具的最小抽象：显式 class-based + 手写 schema
+
+一个工具 = ToolSpec（向 LLM 广告，Step A 中性类型）+ 执行函数（吃 `arguments: dict`，吐字符串 observation）。
+
+选**显式 class-based**（`class Tool(ABC)`，每工具一子类，JSON schema 手写在代码里），不用装饰器签名推断。理由：只有 3-4 个工具、schema 极小，手写让「喂给 LLM 的契约」一眼可见；装饰器推断是藏行为的 magic，违背裸 SDK/代码薄/重可观测的项目气质。
+
+注册表对 ReAct 循环暴露两个口（接上 Step A 类型）：
+```python
+registry.specs() -> List[ToolSpec]              # 传给 llm.chat(tools=...)
+await registry.execute(call: ToolCall) -> str   # 按 name 分发，返回 observation
+```
+这是工具层↔循环的唯一缝：agent 拿 specs 喂 LLM → 收 ToolCall → registry.execute → 拿字符串 → 包成 `ChatMessage(role="tool", tool_call_id=..., content=...)`。
+
+### 2. 沙箱是核心安全边界（逻辑集中一处，不散落）
+
+所有路径参数解析后必须落在 `./wiki/` 内。`WikiSandbox`（或基类 `FileTool`）持有 `root`：
+```python
+def _resolve(self, path: str) -> Path:
+    p = (self.root / path).resolve()          # 摊平符号链接 + ..
+    if not p.is_relative_to(self.root.resolve()):
+        raise SandboxViolation(path)
+    return p
+```
+要挡三类攻击：路径穿越（`../../etc/passwd`）、绝对路径（`/etc/passwd`）、符号链接逃逸。`resolve()` + `is_relative_to`（Py3.9+）是干净写法。
+
+### 3. 错误处理（最关键决策）：工具永不向循环 raise，所有失败→observation 字符串
+
+文件不存在/越界/坏参数都不是 bug，是**信息**——回喂给 LLM 让它自己改（去 list_files、新建、纠正路径）。这是 agentic 的核心。
+
+分层：
+- 越界在 `_resolve` 内部 raise `SandboxViolation`——**真正越界操作绝不执行**；
+- `execute()` 在边界 catch 所有异常 → **yield log 事件**（可观测："拒绝越界访问 X"）→ 把错误串当 observation 返回；
+- `execute()` 永远返回字符串（成功结果或 `"Error: ..."`），循环极简、永不因工具崩。
+
+**推论**：唯一能停 ReAct 循环的是 MAX_STEPS 或 LLM 不再发 tool_call。这把「循环边界」未决点收窄了。
+
+### 4. 工具集：先做 3 个，grep 推迟
+
+- `read_file(path)` → 页面内容或 `"Error: 不存在"`
+- `write_file(path, content)` → **整篇覆盖**（页面是 读旧→产出新全文→写回，不 append），沙箱内**自动建父目录**（LLM 按 category 建 `AI/` 等子目录）；**写入限定 `.md`**（轻量护栏，index.md 也是 md）
+- `list_files(dir?)` → **递归**列出 wiki 内所有 `.md`，返回**相对 wiki 根**路径（如 `AI/transformer.md`），可直接喂回 read_file；不返回绝对路径（泄露沙箱根/混淆 LLM）
+- ~~`grep`~~ → **推迟**。index.md 本就是检索入口（读 index→选候选→读页），不需全文检索；证明不够用再加（不提前抽象）
+
+### 5. 冷启动
+
+首次 ingest 时 `./wiki/` 或 `index.md` 不存在 → **沙箱 init 时确保 `./wiki/` 目录存在，并种一个 skeleton `index.md`**，免得 list/read 返回令人困惑的空。骨架由沙箱层种，比让 LLM 凭空建更稳。
+
+---
+
+### 仍未讨论清楚（下次接续）
+
+- WikiAgent ReAct 循环边界：MAX_STEPS 取值、停止条件已基本明确（无 tool_call 或触顶）；仍需定 LLM 反复写错/兜圈子时的兜底
+- SCHEMA.md 内容：给 LLM 的 wiki 维护操作规范怎么写（相关性打分逻辑、实体提取上限、何时新建 vs 更新页面）
+
+---
+
+*下次会话继续：tool 层设计已定（第八节）。可进 Step B（DeepSeek 工具路径）实现；或先讨论 SCHEMA.md 内容 + ReAct 循环兜底*

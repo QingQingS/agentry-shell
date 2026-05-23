@@ -1,7 +1,7 @@
 # 项目上下文
 
 > 用于对话重启时快速恢复进度。
-> 最近更新：2026-05-21
+> 最近更新：2026-05-23
 > 历史开发记录：`docs/archive/phase1-phase2-history.md`
 
 ---
@@ -14,7 +14,7 @@
 阶段一 ✅  基础架子：FastAPI + WebSocket + CLI + Web UI + AgentInterface
 阶段二 ✅  研究功能：LLM层 / Retriever层 / ResearchAgent / 流式输出 / Tavily / 多源并发
 阶段三 ✅  连续对话：session/intent/agent mode/orchestrator 全部实现，CLI 多轮 E2E 跑通（survey→chat→code_search，连续性+代词消解+落盘验证）。前端 B4 已修（追加式多轮历史），WS 单连接多轮已验证
-下一步 ⏳  WikiAgent（持久化 LLM 策展 Wiki）——设计讨论中，存档见 wiki-agent开发.md（讨论二已完成）。下次从 BaseLLM tool calling 设计开始
+阶段四 🔨  WikiAgent（持久化 LLM 策展 Wiki，项目首个 agentic agent）——设计存档见 wiki-agent开发.md。BaseLLM tool calling 设计已定（讨论三，第七节）。✅ Step A（ToolSpec/ToolCall 中性类型 + ChatMessage/LLMResponse 字段扩展）已并入 master。下一步 ⏳ Step B（DeepSeek 工具路径）；并行待讨论：ReAct 循环边界 / SCHEMA.md / core/tools.py 沙箱
 ```
 
 ---
@@ -307,5 +307,6 @@ async def classify_intent(user_input, session_context, llm) -> IntentResult
 
 ## 八、安全提示
 
-- `.env` 含真实 API Key，项目当前**不是 git 仓库**
-- 如果 `git init`，第一件事是把 `.env` 加入 `.gitignore`
+- 项目已是 git 仓库（2026-05-23 `git init`），`.env` 含真实 API Key，已通过 `.gitignore` 排除（连同 `__pycache__/`、`reports/`、`.DS_Store`）
+- `.env.example` 是安全模板，已入库
+- 提交前务必确认 `.env` 不在 `git diff --cached --name-only` 列表中
