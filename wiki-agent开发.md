@@ -329,4 +329,76 @@ def _resolve(self, path: str) -> Path:
 
 ---
 
-*下次会话继续：Step A（中性类型）✅、Step B（工具路径）✅、Step C（工具层+沙箱）✅ 均已落地。下一步 Step D：实现 agents/wiki_agent.py 的 ReAct 循环（用 ToolRegistry.specs() 喂 LLM、execute(call) 取 observation；**注意 reasoning_content 回传约束**；唯一停循环条件=无 tool_call 或 MAX_STEPS）。Step D 前需先讨论：SCHEMA.md 内容（wiki 维护规范/相关性打分/实体上限/新建 vs 更新）+ ReAct 循环兜底（反复写错/兜圈子）*
+---
+
+## 九、SCHEMA.md 设计（讨论五，2026-05-23 已定）
+
+WikiAgent 的「操作手册」，按设计哲学智能在此、代码极薄。
+
+### 放置方式
+SCHEMA 内容进 **system prompt**（循环启动时 agent 注入），不放 ./wiki/ 让 LLM 用 read_file 读——规范要始终在场、不浪费循环步数。可作为 repo 文件（`agents/wiki_schema.py` 常量或 `wiki_schema.md`）加载。
+
+### 4 个分叉决策（全按推荐拍板）
+1. **相关性判断**：不强制 LLM 输出数字分数；改为**定性纪律 + 写每页前用一句话说明「为何更新/新建」**（保 agentic、省 token、给可观测性）。0.7/0.5 阈值作为引导写进 SCHEMA，不硬算。
+2. **index.md 更新时机**：所有页面写完后**最后统一更新一次**（单次 ingest 是事务单元，省步数）；「index 更新完 = 结束」作为循环 **STOP 信号**。代价：中途崩溃留下不一致，本期可接受。
+3. **category 体系**：LLM **自创但强制先读 index、优先复用已有 category**，index.md 当 category 权威清单压制同义发散。
+4. **合并策略**：更新页面时新知识**整合进知识内容对应小节（非末尾粗暴 append）**，摘要重写以覆盖全部来源，来源文件追加条目，entities 合并去重。
+
+### SCHEMA 要覆盖的 6 块
+
+**A. 角色与目标**：wiki 策展员，接收 .md 文档整合进以主题为中心的知识库；不回答用户问题。
+
+**B. 结构契约（字面精确）**——页面模板：
+```markdown
+---
+title: <主题名>
+category: <类别>
+created: <YYYY-MM-DD>
+updated: <YYYY-MM-DD>
+sources: <已汇入来源文件数>
+entities: [<实体1>, <实体2>, ...]
+---
+
+## 摘要
+<综合所有来源的 2-4 句知识摘要>
+
+## 来源文件
+- <来源文件名> — <YYYY-MM-DD>
+
+## 知识内容
+<结构化正文，按子主题分节>
+```
+index.md 模板：
+```markdown
+# Wiki Index
+*最近更新：<YYYY-MM-DD>*
+
+## <类别>
+- [<标题>](<相对路径>) — <一句描述> | 实体: <e1,e2> | 来源: <n> | <updated>
+```
+路径约定：页面在 `<category>/<slug>.md`，index.md 在根；slug 小写连字符。
+
+**C. 工作流程（引导非死步骤，保 agentic）**：
+1. 读 index.md 了解现有 category 与各页（描述/实体）
+2. 每份输入文档：提炼主题 + 5-8 个关键实体
+3. 凭 index 实体/描述圈候选页 → read_file 读全文
+4. 判断：实质丰富→更新；切线→不动；无匹配→新建；一份文档可命中多页（跨主题拆）
+5. 更新：**先读→合并（不丢旧知识）→整篇 write**，维护 frontmatter；新建：按模板 write，优先复用 category
+6. 全部页面处理完，最后读 index.md 更新条目并 write 回
+7. 完成，停止（不再发 tool_call）
+
+**D. 硬纪律**：
+- **更新页面前必须先 read**（write_file 整篇覆盖，不先读=毁掉整页）——头号纪律
+- 主题中心非文件镜像；多源汇聚同页，跨主题拆多页
+- category 优先复用 index 已有的，抑制同义发散
+- 实体每文档 5-8 上限
+- 有界一致性：只动相关页 + index，不重扫全库
+- 只在 ./wiki/ 内、只写 .md；不删页（本期）；不回答用户问题
+
+**E. 输入约定**：首条消息收到待归档文档的文件名 + 全文。
+
+**F.（写进 D 即可）** 写每页前一句话理由（分叉 1）。
+
+---
+
+*下次会话继续：Step A/B/C ✅、SCHEMA.md 设计 ✅（第九节）。下一步 Step D：实现 agents/wiki_agent.py 的 ReAct 循环（用 ToolRegistry.specs() 喂 LLM、execute(call) 取 observation；**注意 reasoning_content 回传约束**；停循环条件=无 tool_call 或 MAX_STEPS；SCHEMA 进 system prompt）。Step D 前仍需讨论最后一项：**ReAct 循环兜底**（MAX_STEPS 取值、反复写错/兜圈子的处理）。SCHEMA.md 正文可在 Step D 时落地为 repo 文件*
