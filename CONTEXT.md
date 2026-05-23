@@ -29,10 +29,13 @@ agent-shell/
 │   ├── agent_interface.py     # AgentInterface + AgentEvent + 生命周期契约
 │   ├── runner.py              # run_agent()：统一 status/error/钩子
 │   ├── stream.py              # ⚠ 死代码（待删）
+│   ├── session.py             # SessionManager + Session/Turn/ReportRecord + 窗口落盘（阶段三）
+│   ├── intent.py              # classify_intent → {route, mode, target, carry_context, files}（阶段三/四）
+│   ├── tools.py               # 阶段四：Tool/FileTool + read/write/list_files + ToolRegistry + ./wiki/ 沙箱
 │   ├── llm/
-│   │   ├── base.py            # BaseLLM / ChatMessage / LLMResponse / TokenUsage
-│   │   ├── openai_provider.py # OpenAIProvider + DeepSeekProvider
-│   │   ├── anthropic_provider.py
+│   │   ├── base.py            # BaseLLM / ChatMessage / LLMResponse / TokenUsage / ToolSpec / ToolCall（chat 支持 tools=）
+│   │   ├── openai_provider.py # OpenAIProvider + DeepSeekProvider（含工具路径 + reasoning_content 往返）
+│   │   ├── anthropic_provider.py # 工具路径未实现（tools 传入即 NotImplementedError，扩展点）
 │   │   ├── factory.py         # get_llm(tier, config)
 │   │   └── __init__.py
 │   └── retrievers/
@@ -43,9 +46,11 @@ agent-shell/
 │       └── __init__.py
 ├── agents/
 │   ├── echo_agent.py          # 演示用，无 LLM
-│   ├── chat_agent.py          # 单轮聊天
-│   ├── research_agent.py      # 多源并发检索 + 流式报告
-│   ├── orchestrator_agent.py  # ⏳ 待实现：连续对话编排中枢
+│   ├── chat_agent.py          # 单轮聊天（支持 context 注入）
+│   ├── research_agent.py      # 多源并发检索 + 流式报告（mode 分支 + background_context）
+│   ├── orchestrator_agent.py  # 连续对话编排中枢（阶段三；阶段四加 route=wiki dispatch）
+│   ├── wiki_agent.py          # 阶段四：WikiAgent ReAct 循环（项目首个 agentic agent）
+│   ├── wiki_schema.py         # 阶段四：WIKI_SCHEMA 操作手册（注入 system prompt）
 │   └── __init__.py            # ⚠ 自动 import EchoAgent（埋雷，待清空）
 ├── backend/server/
 │   ├── app.py                 # FastAPI 路由
@@ -79,10 +84,26 @@ type 值：
 ### BaseLLM 核心方法
 
 ```python
-await llm.chat(messages)           → LLMResponse
+await llm.chat(messages, tools=None)          → LLMResponse
 async for chunk in llm.chat_stream(messages)  → str 增量（结束后自动 _record_usage）
-llm.cumulative_usage               → TokenUsage（该实例累计用量）
+llm.cumulative_usage                          → TokenUsage（该实例累计用量）
 ```
+
+工具调用（阶段四，仅 OpenAI/DeepSeek 实现）：
+- `chat(messages, tools=[ToolSpec...])` → `LLMResponse.tool_calls`（List[ToolCall]）+ `stop_reason`（"stop"|"tool_calls"）
+- ReAct 循环在 agent 层（不在 BaseLLM）；工具结果用 `ChatMessage(role="tool", content=obs, tool_call_id=...)` 回填
+- ⚠ 思考模型约束：assistant 工具调用轮回传时必须带 `reasoning_content`（否则 DeepSeek 报 400）
+
+### 工具层与 wiki 结构（core/tools.py，阶段四）
+
+```python
+registry = build_wiki_registry(wiki_root)   # 冷启动种 skeleton index.md
+registry.specs()            → List[ToolSpec]        # 喂 llm.chat(tools=)
+await registry.execute(call) → str（observation）   # 永不抛，失败收敛为 "Error: ..."
+```
+- 工具：read_file / write_file（整篇覆盖+建父目录+限定 .md）/ list_files（递归相对路径）
+- 沙箱：所有路径经 `_resolve()`（resolve + is_relative_to）限定 ./wiki/，挡穿越/绝对/符号链接
+- wiki 页面：`<category>/<slug>.md`，YAML frontmatter（title/category/created/updated/sources/entities）+ 摘要/来源文件/知识内容；index.md 是按类别分组的目录脊梁
 
 ### 检索源配置
 
@@ -112,10 +133,12 @@ LLM_PROVIDER=deepseek
 SMART_LLM_MODEL=deepseek-v4-pro
 FAST_LLM_MODEL=deepseek-v4-pro
 DEEPSEEK_API_KEY=sk-9b8169...
-AGENT_CLASS=agents.chat_agent.ChatAgent   # 阶段三改为 OrchestratorAgent
+AGENT_CLASS=agents.orchestrator_agent.OrchestratorAgent   # 阶段三起即编排中枢
 RETRIEVER=arxiv,tavily
 TAVILY_API_KEY=tvly-dev-...
 ```
+
+**触发 wiki 归档**（经 OrchestratorAgent）：在多轮对话中说「把 ./reports/xxx.md 存进 wiki」→ 分类器判 route=wiki → WikiAgent 把文档整合进 `./wiki/`。注意冷启动首轮无上下文会降级 research（见 §七 B10）。
 
 ---
 
@@ -247,7 +270,7 @@ async def classify_intent(user_input, session_context, llm) -> IntentResult
 | ✅ Step 1 | `core/session.py` | SessionManager + 文件落盘 + 窗口管理（WINDOW_SIZE=2，get_recent_context 返回结构化 RecentContext） | `tests/check_session.py` 全绿（已完成） |
 | ✅ Step 2 | `core/intent.py` | IntentClassifier 输出 `{route, mode, target, carry_context}`（LLM+JSON+降级）。**ResearchMode 枚举定在 research_agent.py，intent 反向 import** | `tests/check_intent.py` 离线全绿 + `--live` 4 场景人工确认通过（含代词消解） |
 | ✅ Step 3 | `research_agent.py` `chat_agent.py` | ResearchAgent 加 mode 分支（最小：survey=现行为；paper_lookup/code_search=单查询+针对性报告）+ background_context；ChatAgent 加 context | `tests/check_agents.py` 离线全绿（检索器选择/prompt 注入/context 拼接） |
-| ✅ Step 4 | `orchestrator_agent.py` | class-level Session + 三轴路由（route 选 Agent，mode/target/carry_context 透传）+ 写回。description 暂用正文快照（见 §六待办） | `tests/check_orchestrator.py` 离线全绿（路由/kwargs/转发/写回/carry 门控/隔离） |
+| ✅ Step 4 | `orchestrator_agent.py` | class-level Session + 三轴路由（route 选 Agent，mode/target/carry_context 透传）+ 写回。description 暂用正文快照（见 §七待办） | `tests/check_orchestrator.py` 离线全绿（路由/kwargs/转发/写回/carry 门控/隔离） |
 | ✅ Step 5 | `.env` | 已切 `AGENT_CLASS=agents.orchestrator_agent.OrchestratorAgent` | CLI `--interactive` 三轮 E2E（survey→chat→code_search）真实跑通：连续性 + 代词消解 + ./reports/ 落盘正确；WS 路径确认注入 websocket（每连接隔离）；服务启动冒烟 200。**浏览器 UI 未点击实测**（受前端 B4 影响，留待前端重构） |
 
 依赖顺序：1 → 2 → 3 → 4 → 5（2 和 3 可并行）
@@ -261,7 +284,52 @@ async def classify_intent(user_input, session_context, llm) -> IntentResult
 
 ---
 
-## 六、待处理事项
+## 六、阶段四：WikiAgent（已完成）
+
+> 项目首个真正 agentic（ReAct 工具循环）的 agent。设计推导见 NOTES.md 2026-05-23 各条；
+> 完整开发讨论归档（已冻结、仅供查阅）：`wiki-agent开发.md`。
+
+### 6.1 是什么
+
+持久化 LLM 策展 Wiki：接收一份或多份 .md 文档，由 LLM 自主决定读哪些 wiki 页、写哪些页、
+怎么更新 index.md，把知识整合进**以主题为中心**的本地知识库（`./wiki/`）。WikiAgent 只维护知识，
+不回答用户问题（那是 ChatAgent 的事）。智能在 SCHEMA + prompt 里，代码极薄。
+
+### 6.2 实现步骤（全部完成，每步独立验证）
+
+| 步 | 文件 | 核心 | 验证 |
+|---|------|------|------|
+| ✅ A | `core/llm/base.py` | ToolSpec/ToolCall 中性类型 + ChatMessage/LLMResponse 字段扩展 | 离线测，纯文本无回归 |
+| ✅ B | `core/llm/openai_provider.py` | DeepSeek/OpenAI 工具路径：schema 转换 / 消息三形态序列化 / tool_call 解析 / reasoning_content 往返 | `tests/check_tool_calling.py` 真实 DeepSeek 端到端（假 add 工具） |
+| ✅ C | `core/tools.py` | Tool/FileTool + 3 工具 + ToolRegistry + ./wiki/ 沙箱 + 冷启动 | `tests/check_tools.py` 离线全绿（含 3 类沙箱攻击） |
+| ✅ D | `agents/wiki_agent.py` `wiki_schema.py` | ReAct 循环 + WIKI_SCHEMA | `tests/check_wiki_agent.py` 离线 FakeLLM 全绿 + `--live` 真实 DeepSeek 端到端 |
+| ✅ E | `core/intent.py` `orchestrator_agent.py` | route=wiki 臂 + files 字段 + dispatch 透传 | `check_intent`/`check_orchestrator` 离线 + `--live` 分类器正确判 wiki |
+
+### 6.3 ReAct 循环关键约束
+
+- SCHEMA 进 system prompt；`registry.specs()` 喂 LLM，`execute(call)` 取 observation 回填
+- assistant 工具调用轮必须回传 `reasoning_content`（思考模型约束）
+- 工具永不抛异常（失败即 observation 字符串）→ 唯一停循环条件 = 无 tool_call 或 MAX_STEPS=20
+- 兜圈子：同一 (name,args) 重复 ≥3 次注入一次 nudge
+- result：自然停取 LLM 末轮 content；强制停用 touched_files 合成
+
+### 6.4 接入编排（route=wiki）
+
+IntentResult 加 `files: List[str]`（**保持扁平，未抽象成 tagged union**，仅 wiki 用）。
+Orchestrator `route=="wiki"` → WikiAgent.run(task, files=...)，不传 session 级 wiki_root
+（wiki 跨 session 共享持久库）；写回走 add_turn（不落报告）。
+
+### 6.5 已知边界 / 可选收尾
+
+- ⚠ 冷启动首轮无 session 上下文 → classify 跳过 LLM 降级 research，故「首条消息即归档」落到 research（与 B9 同源，见 §七 B10）
+- SCHEMA 实体上限措辞待微调（--live 见 LLM 提了 10 个，超 5-8 上限）
+- CLI `--interactive` 真实多轮 E2E 冒烟（研究→归档）尚未跑
+- ChatAgent 查 wiki（读取/问答路由）= 后续阶段，未设计
+- 知识图谱（实体已在 frontmatter 留接口）= 后置
+
+---
+
+## 七、待处理事项
 
 ### 活跃 Bug
 
@@ -272,6 +340,7 @@ async def classify_intent(user_input, session_context, llm) -> IntentResult
 | B7 | `agents/research_agent.py` | 研究简报缺逐篇论文简介，直接跳综合结论 | 小 |
 | B8 | `agents/orchestrator_agent.py` | `description` 暂用报告正文前 120 字快照。后期 ResearchAgent 升级为结构化 JSON 输出后，摘要应由 ResearchAgent 产出、Orchestrator 只负责存（避免在编排层多调一次 LLM、放错层） | 小 |
 | B9 | `core/intent.py` | 首轮无上下文时 `classify_intent` 跳过 LLM、固定降级为 research/survey/carry=false。导致"首条消息就是单篇/找代码"无法命中 paper_lookup/code_search（route/carry 确实需上下文，但 mode 本可只凭输入判断）。可选改进：无上下文时仍调 LLM 只定 mode | 小 |
+| B10 | `core/intent.py` | 与 B9 同源：首轮降级 research 使「首条消息就是 wiki 归档」落到 research，wiki 路由命中不了。route/files 本可只凭输入判定。修法同 B9（无上下文仍调一次 LLM） | 小 |
 
 ### 活跃埋雷
 
@@ -286,27 +355,27 @@ async def classify_intent(user_input, session_context, llm) -> IntentResult
 
 ---
 
-## 七、启动提示词
+## 八、启动提示词
 
 ```
 我正在开发 /Users/sunqingqing/projects/agent-shell。
 请读取 CONTEXT.md 了解项目背景和进度。
 
-阶段一、二全部完成。阶段三（连续对话）设计已完成，下一步从 Step 1 开始实现：
-  Step 1: core/session.py — 会话记忆 + 报告文件落盘
-  Step 2: core/intent.py — LLM 意图分类（research/refine/chat）
-  Step 3: ChatAgent + ResearchAgent 支持 context 注入
-  Step 4: agents/orchestrator_agent.py — 编排中枢
-  Step 5: E2E 联调
+阶段一~四全部完成（基础架子 / 研究功能 / 连续对话 / WikiAgent）。
+WikiAgent（阶段四，项目首个 agentic agent）已可独立运行并接入编排（route=wiki）。
 
-埋雷清单在 §六，目前选择"先开发再回头收"。
+下一步可选方向：
+  - 阶段四收尾：首轮 wiki 检测（B10）/ SCHEMA 实体上限微调 / CLI 多轮 E2E 冒烟
+  - 转阶段五（Memory/Storage 长期记忆）或其它
+
+待处理（Bug/埋雷）清单在 §七，目前选择"先开发再回头收"。
+设计讨论过程在 NOTES.md；阶段四开发讨论归档（已冻结）在 wiki-agent开发.md。
 历史开发记录在 docs/archive/phase1-phase2-history.md。
-设计讨论过程在 NOTES.md。
 ```
 
 ---
 
-## 八、安全提示
+## 九、安全提示
 
 - 项目已是 git 仓库（2026-05-23 `git init`），`.env` 含真实 API Key，已通过 `.gitignore` 排除（连同 `__pycache__/`、`reports/`、`.DS_Store`）
 - `.env.example` 是安全模板，已入库
