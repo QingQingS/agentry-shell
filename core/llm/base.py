@@ -11,7 +11,7 @@ LLM 抽象层基础接口。
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable, List, Literal, Optional
 
 
@@ -19,9 +19,29 @@ Role = Literal["system", "user", "assistant", "tool"]
 
 
 @dataclass
+class ToolSpec:
+    """喂给 LLM 的工具定义，与具体 Provider 无关。"""
+
+    name: str
+    description: str
+    parameters: dict  # JSON Schema，描述该工具的入参
+
+
+@dataclass
+class ToolCall:
+    """LLM 要求调用某工具时的归一化表示；id 用于回填工具结果时对齐。"""
+
+    id: str           # provider 给的 call id
+    name: str
+    arguments: dict   # 已解析为 dict（OpenAI 原为 JSON 字符串，在 provider 层解析）
+
+
+@dataclass
 class ChatMessage:
     role: Role
     content: str
+    tool_calls: Optional[List[ToolCall]] = None   # assistant 轮：LLM 发起的工具调用列表
+    tool_call_id: Optional[str] = None            # tool 结果轮：对应的 call id
 
     def to_dict(self) -> dict:
         return {"role": self.role, "content": self.content}
@@ -56,7 +76,9 @@ class LLMResponse:
     usage: TokenUsage
     model: str
     provider: str
-    raw: Optional[Any] = None        # 原始响应对象，调试用
+    raw: Optional[Any] = None                                  # 原始响应对象，调试用
+    tool_calls: List[ToolCall] = field(default_factory=list)  # 无工具调用时为空列表
+    stop_reason: str = "stop"                                  # 归一化停止原因："stop" | "tool_calls"
 
 
 # Token 回调签名：(usage, provider, model) → None 或 Awaitable[None]
