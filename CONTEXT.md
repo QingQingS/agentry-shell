@@ -365,7 +365,6 @@ Orchestrator `route=="wiki"` → WikiAgent.run(task, files=...)，不传 session
 WikiAgent（阶段四，项目首个 agentic agent）已可独立运行并接入编排（route=wiki）。
 
 下一步可选方向：
-  - 阶段四收尾：首轮 wiki 检测（B10）/ SCHEMA 实体上限微调 / CLI 多轮 E2E 冒烟
   - 转阶段五（Memory/Storage 长期记忆）或其它
 
 待处理（Bug/埋雷）清单在 §七，目前选择"先开发再回头收"。
