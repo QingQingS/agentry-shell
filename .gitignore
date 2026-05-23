@@ -10,6 +10,7 @@ venv/
 
 # 运行时产物
 reports/
+wiki/
 
 # macOS
 .DS_Store
