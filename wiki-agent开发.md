@@ -435,4 +435,12 @@ for step in range(MAX_STEPS):
 
 ---
 
-*下次会话继续：Step A/B/C ✅、SCHEMA 设计 ✅（九节）、ReAct 兜底 ✅（十节）。**所有设计输入已齐**，下一步直接实现 Step D：agents/wiki_agent.py（ReAct 循环 + 落地 SCHEMA.md 正文为 repo 文件）。要点：SCHEMA 进 system prompt；assistant 轮回传 reasoning_content；停循环=无 tool_call 或 MAX_STEPS=20；兜圈子 nudge；跟踪 touched_files 供 result。之后 Step E 接入 Orchestrator（route=wiki）*
+### Step D 落地状态（2026-05-23）
+
+✅ Step D 已实现并验证。`agents/wiki_schema.py`（WIKI_SCHEMA 常量，落地九节）+ `agents/wiki_agent.py`（WikiAgent ReAct 循环：读输入文档→SCHEMA 进 system→工具循环，reasoning_content 回传、MAX_STEPS=20、兜圈子 nudge≥3、touched_files 跟踪、每步 yield log、自然停取末轮 content 作 result）。`core/llm/__init__.py` 补导出 ToolSpec/ToolCall。`tests/check_wiki_agent.py`：离线 FakeLLM 确定性测全绿（工具分发/消息往返/touched/自然停/nudge 一次/MAX_STEPS 触顶/空输入抛错）+ `--live` 真实 DeepSeek 端到端跑通（空库→读 index→新建 AI/transformer.md→更新 index→总结）。
+
+观察：--live 中 LLM 提取了 10 个实体，超 SCHEMA 的 5-8 上限——prompt 遵守度的小瑕疵，非代码 bug；后续可微调 SCHEMA 措辞（标为待观察，不阻塞）。
+
+---
+
+*下次会话继续：Step A/B/C/D ✅ 全部落地，WikiAgent 可独立运行（agentic ReAct 跑通）。下一步 Step E：接入 OrchestratorAgent —— IntentClassifier 加 `route=wiki` 臂（payload `{files:[...]}`）、Orchestrator 加 wiki dispatch（透传 files/wiki_root 给 WikiAgent.run），不动 research/chat 路径；route 增多且各带不同 payload 时 IntentResult 可重构为 tagged union（不提前抽象）。另可选收尾：SCHEMA 实体上限措辞微调*
