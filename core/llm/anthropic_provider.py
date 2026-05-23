@@ -12,7 +12,7 @@ from typing import Any, AsyncIterator, List, Optional
 
 from anthropic import AsyncAnthropic
 
-from .base import BaseLLM, ChatMessage, LLMResponse, TokenUsage
+from .base import BaseLLM, ChatMessage, LLMResponse, ToolSpec, TokenUsage
 
 
 class AnthropicProvider(BaseLLM):
@@ -32,8 +32,15 @@ class AnthropicProvider(BaseLLM):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        tools: Optional[List[ToolSpec]] = None,
         **kwargs: Any,
     ) -> LLMResponse:
+        # 工具路径本期只实现 OpenAI/DeepSeek；Anthropic 的 tool_use/tool_result
+        # 块往返留作扩展点（详见 wiki-agent开发.md 第七节）。
+        if tools:
+            raise NotImplementedError(
+                "AnthropicProvider 暂不支持 tool calling；本期工具路径仅 DeepSeek/OpenAI"
+            )
         system_parts = [m.content for m in messages if m.role == "system"]
         chat_messages = [m.to_dict() for m in messages if m.role != "system"]
         system = "\n\n".join(system_parts) if system_parts else None

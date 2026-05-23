@@ -234,7 +234,26 @@ Anthropic 工具支持（若要）是独立后续步。
 
 ### 待后续细化（不在 BaseLLM 层）
 
-- OpenAI 参数 JSON 可能畸形（LLM 偶发坏 JSON）：可恢复事件，provider 解析失败不 crash，best-effort `arguments={}` 并保留原始串，由 agent 循环决定回喂「参数无效」。放到 WikiAgent ReAct 那轮细化。
+- OpenAI 参数 JSON 可能畸形（LLM 偶发坏 JSON）：可恢复事件，provider 解析失败不 crash，best-effort `arguments={}`（已实现）。后续 agent 循环可决定回喂「参数无效」。
+
+### ⚠ Step B 实现中发现的坑：思考模型的 reasoning_content（2026-05-23）
+
+`deepseek-v4-pro` 是**思考模型**：返回 tool_call 时附带 `reasoning_content`，续接对话时**必须原样回传**该字段，否则 API 报 400（"reasoning_content in the thinking mode must be passed back"）。
+
+**解法（已实现）**：`ChatMessage` 和 `LLMResponse` 各加一个中性可选字段 `reasoning_content`，OpenAIProvider 解析时取出、序列化 assistant 工具调用轮时回传。DeepSeek 细节锁在 provider 层，中性类型只存不解释，其他 provider 忽略。
+
+**对未来 ReAct 循环的硬约束**：loop 往 messages 追加 assistant 工具调用轮时，**必须带上 reasoning_content**：
+```python
+messages.append(ChatMessage(
+    role="assistant", content=resp.content,
+    tool_calls=resp.tool_calls, reasoning_content=resp.reasoning_content,
+))
+```
+忘了带 → 第二轮 400。写 WikiAgent ReAct 循环时务必记得（可考虑给 LLMResponse 加 `to_assistant_message()` 助手方法把这事封装掉，避免每处手抄）。
+
+### Step B 落地状态（2026-05-23）
+
+✅ Step B 已实现并验证。`core/llm/base.py` chat 加 tools 参数；`openai_provider.py` 实现工具 schema 转换 / 消息三形态序列化 / tool_call 解析 / reasoning_content 往返；`anthropic_provider.py` tools 传入时 NotImplementedError（扩展点）。`tests/check_tool_calling.py` 真实 DeepSeek 端到端通过（假 add 工具：发起调用→回填→答出 5），离线 4 套回归全绿。
 
 ### Step A 落地状态（2026-05-23）
 
@@ -302,4 +321,4 @@ def _resolve(self, path: str) -> Path:
 
 ---
 
-*下次会话继续：tool 层设计已定（第八节）。可进 Step B（DeepSeek 工具路径）实现；或先讨论 SCHEMA.md 内容 + ReAct 循环兜底*
+*下次会话继续：Step A（中性类型）✅、Step B（DeepSeek 工具路径）✅ 均已落地。工具层设计已定（第八节）。下一步：实现 core/tools.py（工具层 + ./wiki/ 沙箱）→ agents/wiki_agent.py（ReAct 循环，注意 reasoning_content 回传约束）。仍待讨论：SCHEMA.md 内容 + ReAct 循环兜底*

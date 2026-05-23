@@ -42,6 +42,9 @@ class ChatMessage:
     content: str
     tool_calls: Optional[List[ToolCall]] = None   # assistant 轮：LLM 发起的工具调用列表
     tool_call_id: Optional[str] = None            # tool 结果轮：对应的 call id
+    # 不透明的推理轨迹：某些思考模型（如 DeepSeek 思考态）返回 tool_call 时附带，
+    # 续接对话时必须原样回传，否则 API 报错。中性类型只存不解释，仅相关 Provider 读写。
+    reasoning_content: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {"role": self.role, "content": self.content}
@@ -79,6 +82,7 @@ class LLMResponse:
     raw: Optional[Any] = None                                  # 原始响应对象，调试用
     tool_calls: List[ToolCall] = field(default_factory=list)  # 无工具调用时为空列表
     stop_reason: str = "stop"                                  # 归一化停止原因："stop" | "tool_calls"
+    reasoning_content: Optional[str] = None                   # 思考模型的推理轨迹，需回传时用
 
 
 # Token 回调签名：(usage, provider, model) → None 或 Awaitable[None]
@@ -114,10 +118,15 @@ class BaseLLM(ABC):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        tools: Optional[List[ToolSpec]] = None,
         **kwargs: Any,
     ) -> LLMResponse:
         """
         非流式调用。等待完整响应，返回 LLMResponse。
+
+        tools 非空时启用工具调用：Provider 负责把 ToolSpec 翻译成自家
+        wire 格式，并把响应里的工具调用解析回 LLMResponse.tool_calls。
+        ReAct 循环不在此层——本方法只完成单次调用的归一化。
 
         子类实现要点：
             1. 调用 SDK
