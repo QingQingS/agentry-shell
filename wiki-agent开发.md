@@ -401,4 +401,38 @@ index.md 模板：
 
 ---
 
-*下次会话继续：Step A/B/C ✅、SCHEMA.md 设计 ✅（第九节）。下一步 Step D：实现 agents/wiki_agent.py 的 ReAct 循环（用 ToolRegistry.specs() 喂 LLM、execute(call) 取 observation；**注意 reasoning_content 回传约束**；停循环条件=无 tool_call 或 MAX_STEPS；SCHEMA 进 system prompt）。Step D 前仍需讨论最后一项：**ReAct 循环兜底**（MAX_STEPS 取值、反复写错/兜圈子的处理）。SCHEMA.md 正文可在 Step D 时落地为 repo 文件*
+---
+
+## 十、ReAct 循环兜底设计（讨论六，2026-05-23 已定）
+
+### 循环骨架
+```
+messages = [system(SCHEMA), user(输入文档全文)]
+for step in range(MAX_STEPS):
+    resp = await llm.chat(messages, tools=registry.specs())
+    messages.append(assistant 轮)   # 含 tool_calls + reasoning_content（回传约束！）
+    if not resp.tool_calls:
+        break                        # LLM 自然收尾，resp.content 即总结
+    for call in resp.tool_calls:
+        obs = await registry.execute(call)   # 永不抛，返回字符串
+        messages.append(tool 结果轮)
+        yield log 事件
+```
+一个 step = 一次 LLM 调用（可能含多个 tool_call，全执行后回填）。
+
+### 4 个分叉决策
+1. **MAX_STEPS = 20**（每次 ingest 的 LLM 调用上限，可配常量）。命中后：停止，emit warning，列出本次已写/改的文件（agent 跟踪 `touched_files`），**不自动修 index**（无事务）。不做强制总结调用。
+2. **兜圈子检测（采纳 B）**：检测同一 `(name, args)` 重复 ≥3 次 → **注入一次 nudge**（"你已多次执行 X 得到相同结果，请改变策略或结束"）；再不停交给 MAX_STEPS 硬截。nudge 只注入一次。
+3. **result 产出**：自然停止 → LLM 最后一轮 text content 即为 result；强制停止 → agent 用 `touched_files` 合成（"已写入/更新 N 页，因达步数上限提前结束"）。不额外发"请总结"调用。
+4. **"写错"**：路径越界/非 .md 由工具层返 error observation、LLM 自纠（已覆盖）；**语义写错不做程序兜底**（工具层无法判断对错），靠 SCHEMA 纪律 + LLM 自律。
+
+### 非分叉约定
+- **可观测性**：每个 tool_call 按 name+结果 yield 一条 log（"读取 index.md"/"写入页面 X"/"拒绝越界 Y"）；LLM 工具轮的 text content（分叉 1 那句理由）也 yield 成 log。
+- **已知边界（本期不解决）**：多文档 + 读大页面致 context 增长，先观察、触顶再说。
+
+### Step D 设计输入已齐
+工具层（第八节）+ SCHEMA（第九节）+ 兜底（第十节）全部就位，可直接实现 agents/wiki_agent.py。
+
+---
+
+*下次会话继续：Step A/B/C ✅、SCHEMA 设计 ✅（九节）、ReAct 兜底 ✅（十节）。**所有设计输入已齐**，下一步直接实现 Step D：agents/wiki_agent.py（ReAct 循环 + 落地 SCHEMA.md 正文为 repo 文件）。要点：SCHEMA 进 system prompt；assistant 轮回传 reasoning_content；停循环=无 tool_call 或 MAX_STEPS=20；兜圈子 nudge；跟踪 touched_files 供 result。之后 Step E 接入 Orchestrator（route=wiki）*
