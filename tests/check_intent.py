@@ -73,6 +73,22 @@ async def offline_checks() -> None:
     r = await classify_intent("找代码", _ctx(), llm)
     assert r.route == "research" and r.mode == "survey" and r.target == "x"
 
+    # 6) route=wiki + files → 提取路径，target 空、carry=false
+    llm = StubLLM(content='{"route":"wiki","mode":"survey","target":"","carry_context":false,"files":["./reports/transformer.md","notes/x.md"]}')
+    r = await classify_intent("把这两份存进 wiki", _ctx(), llm)
+    assert r.route == "wiki" and r.files == ["./reports/transformer.md", "notes/x.md"]
+    assert r.target == "" and r.carry_context is False
+
+    # 7) route=wiki 但 files 缺失/为空 → 安全降级 research
+    llm = StubLLM(content='{"route":"wiki","mode":"survey","target":"","carry_context":false,"files":[]}')
+    r = await classify_intent("存进 wiki", _ctx(), llm)
+    assert r.route == "research" and r.files == [], "wiki 无文件应降级 research"
+
+    # 8) 非 wiki 路由的 files 默认空
+    llm = StubLLM(content='{"route":"chat","mode":"survey","target":"","carry_context":true}')
+    r = await classify_intent("追问", _ctx(), llm)
+    assert r.route == "chat" and r.files == []
+
     print("OK")
 
 
@@ -87,10 +103,11 @@ async def live_checks() -> None:
         "讲讲 Attention Is All You Need 这篇论文",
         "帮我找找它的开源实现",
         "刚才报告里说的注意力机制是什么意思",
+        "把 ./reports/transformer.md 存进 wiki",
     ]
     for q in cases:
         r = await classify_intent(q, ctx, llm)
-        print(f"[{q}]\n  → route={r.route} mode={r.mode} carry={r.carry_context} target={r.target!r}\n")
+        print(f"[{q}]\n  → route={r.route} mode={r.mode} carry={r.carry_context} target={r.target!r} files={r.files}\n")
 
 
 def main() -> None:

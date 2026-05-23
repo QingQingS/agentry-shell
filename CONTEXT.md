@@ -14,7 +14,8 @@
 阶段一 ✅  基础架子：FastAPI + WebSocket + CLI + Web UI + AgentInterface
 阶段二 ✅  研究功能：LLM层 / Retriever层 / ResearchAgent / 流式输出 / Tavily / 多源并发
 阶段三 ✅  连续对话：session/intent/agent mode/orchestrator 全部实现，CLI 多轮 E2E 跑通（survey→chat→code_search，连续性+代词消解+落盘验证）。前端 B4 已修（追加式多轮历史），WS 单连接多轮已验证
-阶段四 🔨  WikiAgent（持久化 LLM 策展 Wiki，项目首个 agentic agent）——设计存档见 wiki-agent开发.md（七~十节）。✅ Step A 中性类型 / ✅ Step B 工具路径（含思考模型 reasoning_content 回传坑）/ ✅ Step C core/tools.py 工具层+沙箱 / ✅ Step D agents/wiki_agent.py ReAct 循环 + agents/wiki_schema.py（离线 FakeLLM 测全绿 + 真实 DeepSeek 端到端跑通：空库→新建页→更新 index→总结）。WikiAgent 已可独立运行。下一步 ⏳ Step E 接入 Orchestrator（route=wiki，payload {files:[...]}）
+阶段四 ✅  WikiAgent（持久化 LLM 策展 Wiki，项目首个 agentic agent）——设计存档见 wiki-agent开发.md（七~十节）。Step A 中性类型 / B 工具路径（含思考模型 reasoning_content 回传坑）/ C core/tools.py 工具层+沙箱 / D agents/wiki_agent.py ReAct 循环+wiki_schema.py / E 接入 Orchestrator（intent 加 route=wiki 臂+files 字段，dispatch 透传 files）全部完成。离线全绿 + 真实 DeepSeek 跑通（WikiAgent 端到端归档；分类器 live 正确判 wiki）。
+            ⚠ 已知边界：冷启动首轮（无 session 上下文）classify 跳过 LLM 降级 research，故「首条消息就归档 wiki」会落到 research（与 B9 同源）；自然流程「先研究→再归档」有上下文则正常命中 wiki。
 ```
 
 ---

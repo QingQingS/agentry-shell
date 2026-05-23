@@ -443,4 +443,14 @@ for step in range(MAX_STEPS):
 
 ---
 
-*下次会话继续：Step A/B/C/D ✅ 全部落地，WikiAgent 可独立运行（agentic ReAct 跑通）。下一步 Step E：接入 OrchestratorAgent —— IntentClassifier 加 `route=wiki` 臂（payload `{files:[...]}`）、Orchestrator 加 wiki dispatch（透传 files/wiki_root 给 WikiAgent.run），不动 research/chat 路径；route 增多且各带不同 payload 时 IntentResult 可重构为 tagged union（不提前抽象）。另可选收尾：SCHEMA 实体上限措辞微调*
+### Step E 落地状态（2026-05-23）—— 阶段四完成
+
+✅ Step E 已实现并验证。`core/intent.py`：`_ROUTES` 加 "wiki"；IntentResult 加 `files: List[str]`（**保持扁平、不提前抽象 tagged union**，仅 wiki 用 files）；分类 prompt 加 wiki 路由说明 + files 字段 + 示例；`_parse` 处理 wiki（提取 files，wiki 但无 files → 安全降级 research）。`agents/orchestrator_agent.py`：import WikiAgent + `elif route=="wiki"` dispatch（透传 files，不传 session 级 wiki_root → 用 WikiAgent 默认，wiki 跨 session 共享）；write_back 走既有 else 分支（add_turn，不落报告）。
+
+验证：`tests/check_intent.py` 加 wiki 解析用例（提取/无文件降级/非 wiki files 空）；`tests/check_orchestrator.py` 加 FakeWikiAgent + wiki dispatch 轮（透传 files、不注入背景、不新增报告、落 turn）。离线全套全绿。`--live`：真实分类器正确把「把 X.md 存进 wiki」判成 route=wiki 并抽出路径，其余 4 用例无回归。
+
+⚠ **已知边界**：冷启动首轮无 session 上下文时 classify_intent 跳过 LLM、降级 research（与 B9 同源），故「首条消息就是 wiki 归档」会落到 research；自然流程「先研究产出报告 → 再归档」有上下文则正常命中 wiki。如需首轮即支持 wiki，需让 classify 在无上下文时仍调一次 LLM（route/files 本可只凭输入判定）——留作可选改进。
+
+---
+
+*WikiAgent（阶段四）全链路完成：Step A/B/C/D/E ✅。可独立运行，也已接入连续对话编排（route=wiki）。剩余可选收尾：①首轮 wiki 检测（B9 同源）②SCHEMA 实体上限措辞微调（--live 见 LLM 提了 10 个超 5-8 上限）③CLI --interactive 真实多轮 E2E 冒烟（研究→归档）。下一步可转向阶段五或先做这些收尾*

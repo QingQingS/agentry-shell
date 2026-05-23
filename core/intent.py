@@ -18,14 +18,14 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 from agents.research_agent import ResearchMode
 from core.llm import ChatMessage
 from core.session import RecentContext
 
-_ROUTES = {"research", "chat"}
+_ROUTES = {"research", "chat", "wiki"}
 _MODES = {m.value for m in ResearchMode}
 _RECENT_TURNS_IN_PROMPT = 3
 _RESPONSE_SNIPPET = 120
@@ -37,6 +37,7 @@ class IntentResult:
     mode: str
     target: str
     carry_context: bool
+    files: List[str] = field(default_factory=list)   # 仅 route=wiki：待归档的 .md 路径
 
 
 def _degraded(target: str) -> IntentResult:
@@ -66,13 +67,15 @@ def _build_messages(user_input: str, ctx: RecentContext) -> List[ChatMessage]:
     system = (
         "你是对话路由器。根据已有研究背景和最近对话，判断用户新输入应如何处理，"
         "只输出一个 JSON 对象，不要任何其它文字。字段：\n"
-        '  "route": "chat" 或 "research"。chat = 能用已有报告直接回答的追问，无需新检索；'
-        "research = 需要发起新的检索。\n"
-        '  "mode": "survey" | "paper_lookup" | "code_search"（仅 research 有意义，chat 时填 "survey"）。'
+        '  "route": "chat" | "research" | "wiki"。chat = 能用已有报告直接回答的追问，无需新检索；'
+        "research = 需要发起新的检索；wiki = 用户想把已有的 .md 文档归档/存入知识库（wiki）。\n"
+        '  "mode": "survey" | "paper_lookup" | "code_search"（仅 research 有意义，其它时填 "survey"）。'
         "survey = 广度调研多角度；paper_lookup = 针对单篇论文/单一目标；code_search = 找开源代码/GitHub 实现。\n"
-        '  "target": 可直接用于检索的查询词（research 时填，尽量具体；chat 时填空串）。\n'
-        '  "carry_context": true/false，这一轮是否延续上文（需要带上轮报告作背景）。话题切换则 false。\n'
-        '示例：{"route": "research", "mode": "code_search", "target": "Attention Is All You Need implementation", "carry_context": true}'
+        '  "target": 可直接用于检索的查询词（research 时填，尽量具体；chat/wiki 时填空串）。\n'
+        '  "carry_context": true/false，这一轮是否延续上文（需要带上轮报告作背景）。话题切换或 wiki 归档则 false。\n'
+        '  "files": 字符串数组，仅 route="wiki" 时填，从用户输入中提取出待归档的 .md 文件路径；其它 route 填空数组 []。\n'
+        '示例1：{"route": "research", "mode": "code_search", "target": "Attention Is All You Need implementation", "carry_context": true, "files": []}\n'
+        '示例2：{"route": "wiki", "mode": "survey", "target": "", "carry_context": false, "files": ["./reports/transformer.md"]}'
     )
     user = (
         f"已有研究背景：\n{reports_block}\n\n"
@@ -94,6 +97,15 @@ def _parse(text: str, fallback_target: str) -> IntentResult:
     route = data.get("route")
     if route not in _ROUTES:
         return _degraded(fallback_target)
+
+    if route == "wiki":
+        raw = data.get("files")
+        files = [str(f).strip() for f in raw if str(f).strip()] if isinstance(raw, list) else []
+        if not files:
+            return _degraded(fallback_target)   # 归档却没识别出文件 → 安全降级为 research
+        return IntentResult(
+            route="wiki", mode=ResearchMode.SURVEY.value, target="", carry_context=False, files=files
+        )
 
     mode = data.get("mode")
     if mode not in _MODES:

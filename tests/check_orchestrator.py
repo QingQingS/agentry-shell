@@ -43,6 +43,16 @@ class FakeChatAgent:
         yield AgentEvent(type="result", content=f"ANSWER::{task}")
 
 
+class FakeWikiAgent:
+    def __init__(self, config=None, websocket=None):
+        pass
+
+    async def run(self, task, **kwargs):
+        CAPTURED.append(("wiki", task, kwargs))
+        yield AgentEvent(type="log", content="fake wiki log")
+        yield AgentEvent(type="result", content=f"CURATED::{task}")
+
+
 def _make_classifier(script):
     """按调用次序返回预设 IntentResult。"""
     seq = iter(script)
@@ -66,12 +76,14 @@ async def main_async() -> None:
         OrchestratorAgent._session_manager = SessionManager(reports_dir=tmp, window_size=2)
         orch_mod.ResearchAgent = FakeResearchAgent
         orch_mod.ChatAgent = FakeChatAgent
+        orch_mod.WikiAgent = FakeWikiAgent
         orch_mod.get_llm = lambda **kw: None  # classify 已 stub，不需要真 LLM
 
         orch_mod.classify_intent = _make_classifier([
             IntentResult("research", "survey", "2026 LLM", carry_context=False),       # 轮1
             IntentResult("research", "code_search", "Transformer impl", carry_context=True),  # 轮2
             IntentResult("chat", "survey", "", carry_context=True),                    # 轮3
+            IntentResult("wiki", "survey", "", carry_context=False, files=["./reports/x.md"]),  # 轮4
         ])
 
         agent = OrchestratorAgent(config=None, websocket=None)  # id(None) 恒定 → 同一 session
@@ -106,6 +118,17 @@ async def main_async() -> None:
         assert len(session.reports) == 2, "chat 不新增报告"
         assert len(session.turns) == 3 and session.turns[-1].route == "chat"
         assert session.turns[-1].agent_response == "ANSWER::刚才说的是什么意思"
+
+        # 轮4：wiki → 透传 files，落 turn（不新增报告）
+        events = await run_turn(agent, "把 ./reports/x.md 存进 wiki")
+        assert any(e.type == "result" and e.content == "CURATED::把 ./reports/x.md 存进 wiki" for e in events), "应转发 wiki worker 的 result"
+        kind, wtask, kw = CAPTURED[-1]
+        assert kind == "wiki" and wtask == "把 ./reports/x.md 存进 wiki", "wiki 用原始 task"
+        assert kw["files"] == ["./reports/x.md"], "应透传 files 给 WikiAgent"
+        assert "background_context" not in kw and "context" not in kw, "wiki 不注入背景/context"
+        assert len(session.reports) == 2, "wiki 不新增报告"
+        assert len(session.turns) == 4 and session.turns[-1].route == "wiki"
+        assert session.turns[-1].agent_response == "CURATED::把 ./reports/x.md 存进 wiki"
 
         # session 隔离：不同 websocket → 不同 id → 不同 session
         other = OrchestratorAgent(config=None, websocket=object())
