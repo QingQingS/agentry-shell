@@ -1,6 +1,7 @@
 ---
 title: Agent Builder
 category: AI
+description: AI Agent 构建的核心理念、三大要素、渐进复杂度与反模式
 created: 2026-05-23
 updated: 2026-05-23
 sources: 1

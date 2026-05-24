@@ -1,6 +1,7 @@
 ---
 title: 理想 Agent 助手
 category: AI
+description: 深度了解使用者的个人 Agent 愿景：专业能力、持续成长机制、上下文记忆与连续性及待解决架构问题
 created: 2026-05-23
 updated: 2026-05-23
 sources: 1
