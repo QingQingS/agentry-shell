@@ -72,19 +72,19 @@ def patch_llm(fake: FakeLLM):
 
 
 async def scenario_natural(check) -> None:
-    print("\n[场景1] 自然停止：list→read index→写页→更新 index→收尾")
+    print("\n[场景1] 自然停止（Opt2 流程）：注入 catalog → list → 写页 → 系统重生成 index → 收尾")
     with tempfile.TemporaryDirectory() as tmp:
         src = Path(tmp) / "transformer_note.md"
         src.write_text("# Transformer\n注意力机制是核心。", encoding="utf-8")
         wiki = Path(tmp) / "wiki"
 
-        page = "---\ntitle: Transformer\ncategory: AI\n---\n## 知识内容\n注意力机制"
+        page = ("---\ntitle: Transformer\ncategory: AI\n"
+                "description: 注意力机制综述\nentities: [Attention, Transformer]\n"
+                "---\n## 知识内容\n注意力机制")
         fake = FakeLLM([
             tool_resp(tc("list_files")),
-            tool_resp(tc("read_file", path="index.md")),
             tool_resp(tc("write_file", path="AI/transformer.md", content=page)),
-            tool_resp(tc("write_file", path="index.md", content="# Wiki Index\n## AI\n- [Transformer](AI/transformer.md)")),
-            text_resp("完成：新建 AI/transformer.md 并更新 index。"),
+            text_resp("完成：新建 AI/transformer.md。"),
         ])
         patch_llm(fake)
 
@@ -94,21 +94,50 @@ async def scenario_natural(check) -> None:
 
         check((wiki / "AI" / "transformer.md").is_file(), "write_file 真实落盘了页面")
         check("注意力机制" in (wiki / "AI" / "transformer.md").read_text(encoding="utf-8"), "页面内容正确")
-        check(result == "完成：新建 AI/transformer.md 并更新 index。", f"自然停止取 LLM 末轮 content 作 result：{result!r}")
+        check(result == "完成：新建 AI/transformer.md。", f"自然停止取 LLM 末轮 content 作 result：{result!r}")
         check("result" in types and types.count("result") == 1, "恰好一个 result 事件")
         check(any(e.type == "tokens" for e in events), "有 tokens 事件")
+        # 第 1 轮 user 消息注入了 catalog（LLM 无需读 index.md）
+        first_user = next(m for m in fake.turns[0] if m.role == "user")
+        check("wiki 当前目录" in first_user.content, "开局 prompt 注入了 catalog")
+        # index.md 由代码从 frontmatter 重生成（含描述），非 LLM 所写
+        idx = (wiki / "index.md").read_text(encoding="utf-8")
+        check("[Transformer](AI/transformer.md)" in idx and "注意力机制综述" in idx,
+              "index.md 被系统从 frontmatter 重生成（含 description）")
+        check(any(e.type == "log" and "重新生成" in e.content for e in events), "有 index 重生成日志")
         # 消息往返：第2轮起 messages 里应出现 assistant 工具轮 + tool 结果轮
         roles_turn2 = [m.role for m in fake.turns[1]]
         check("assistant" in roles_turn2 and "tool" in roles_turn2, f"工具结果回填到消息历史：{roles_turn2}")
-        # assistant 轮带 tool_calls
         asst = next(m for m in fake.turns[1] if m.role == "assistant")
         check(bool(asst.tool_calls), "assistant 轮携带 tool_calls 回传")
-        log_writes = [
+
+
+async def scenario_index_blocked(check) -> None:
+    print("\n[场景4] index.md 硬挡：LLM 写 index 被拒，但系统仍从 frontmatter 重生成")
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "note.md"
+        src.write_text("# RAG\n检索增强生成。", encoding="utf-8")
+        wiki = Path(tmp) / "wiki"
+
+        page = ("---\ntitle: RAG\ncategory: AI\ndescription: 检索增强生成\n"
+                "entities: [RAG]\n---\n## 知识内容\nRAG")
+        fake = FakeLLM([
+            tool_resp(tc("write_file", path="AI/rag.md", content=page)),
+            tool_resp(tc("write_file", path="index.md", content="LLM 乱写的 index")),
+            text_resp("完成。"),
+        ])
+        patch_llm(fake)
+
+        events = await collect(WikiAgent(config=None), files=[str(src)], wiki_root=str(wiki))
+        # 写 index.md 的那次工具结果应是 Error（被硬挡）
+        leaf_after_index = [
             e.content for e in events
-            if e.type == "log" and e.metadata.get("trace") == "action"
-            and e.content.startswith("write_file(")
+            if e.type == "log" and e.metadata.get("trace") == "leaf" and e.content.startswith("✗")
         ]
-        check(len(log_writes) == 2, f"两次写入各有 action log：{log_writes}")
+        check(any("index.md" in c for c in leaf_after_index), f"写 index.md 被拒（observation 报错）：{leaf_after_index}")
+        idx = (wiki / "index.md").read_text(encoding="utf-8")
+        check("LLM 乱写的 index" not in idx, "LLM 的 index 写入未生效")
+        check("[RAG](AI/rag.md)" in idx, "index.md 仍由系统从 frontmatter 正确重生成")
 
 
 async def scenario_nudge_and_maxsteps(check) -> None:
@@ -149,7 +178,7 @@ async def scenario_no_input(check) -> None:
 
 
 async def scenario_live(check) -> None:
-    print("\n[场景4 --live] 真实 DeepSeek 端到端冒烟")
+    print("\n[场景5 --live] 真实 DeepSeek 端到端冒烟")
     wiki_mod.get_llm = _REAL_GET_LLM   # 还原被前面场景 monkeypatch 掉的工厂
     from core.config import Config
     src_text = (
@@ -190,6 +219,7 @@ async def main() -> int:
 
     await scenario_natural(check)
     await scenario_nudge_and_maxsteps(check)
+    await scenario_index_blocked(check)
     await scenario_no_input(check)
     if live:
         await scenario_live(check)

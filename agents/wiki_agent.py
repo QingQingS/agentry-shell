@@ -23,6 +23,7 @@ from typing import AsyncIterator, List, Tuple
 from core.agent_interface import AgentEvent, AgentInterface
 from core.llm import ChatMessage, get_llm
 from core.tools import build_wiki_registry
+from core.wiki_index import build_catalog, regenerate_index
 
 from .wiki_schema import WIKI_SCHEMA
 
@@ -64,9 +65,10 @@ class WikiAgent(AgentInterface):
         )
 
         today = date.today().isoformat()
+        catalog = build_catalog(wiki_root)   # 代码侧目录，注入 prompt（LLM 不再读 index.md）
         messages = [
             ChatMessage(role="system", content=WIKI_SCHEMA),
-            ChatMessage(role="user", content=self._format_input(docs, today)),
+            ChatMessage(role="user", content=self._format_input(docs, today, catalog)),
         ]
 
         touched: List[str] = []          # 本次成功写入/更新的页面（去重前）
@@ -128,6 +130,10 @@ class WikiAgent(AgentInterface):
                 yield AgentEvent(type="log", content="检测到重复调用，已注入提醒（nudge）")
                 nudged = True
 
+        # 循环结束：index.md 由代码从各页 frontmatter 确定性重生成（LLM 全程不读写它）
+        regenerate_index(wiki_root, today)
+        yield AgentEvent(type="log", content="index.md 已由系统从各页 frontmatter 重新生成")
+
         usage = llm.cumulative_usage
         yield AgentEvent(
             type="tokens",
@@ -160,8 +166,13 @@ class WikiAgent(AgentInterface):
         return [Path(tok) for tok in task.split() if tok.strip()]
 
     @staticmethod
-    def _format_input(docs: List[Tuple[str, str]], today: str) -> str:
-        parts = [f"今天的日期是 {today}。下面是待归档的 {len(docs)} 份文档，请整合进 wiki：\n"]
+    def _format_input(docs: List[Tuple[str, str]], today: str, catalog: str) -> str:
+        parts = [
+            f"今天的日期是 {today}。",
+            "\nwiki 当前目录（系统维护，据此了解已有类别与页面；不必读 index.md）：",
+            catalog,
+            f"\n下面是待归档的 {len(docs)} 份文档，请整合进 wiki：",
+        ]
         for name, content in docs:
             parts.append(f"\n===== 文档：{name} =====\n{content}\n===== 文档结束：{name} =====")
         return "\n".join(parts)

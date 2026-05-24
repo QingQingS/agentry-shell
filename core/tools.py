@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import List
 
 from core.llm.base import ToolCall, ToolSpec
+from core.wiki_index import INDEX_FILENAME
 
 
 class SandboxViolation(Exception):
@@ -96,6 +97,8 @@ class WriteFileTool(FileTool):
         p = self._resolve(path)  # 沙箱优先校验
         if p.suffix != ".md":
             return f"Error: 只允许写入 .md 文件，拒绝: {path}"
+        if p == self.root / INDEX_FILENAME:
+            return "Error: index.md 由系统自动维护，无需也不允许手动写入；只要写好各页 frontmatter 即可。"
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         rel = p.relative_to(self.root)
