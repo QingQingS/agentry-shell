@@ -103,8 +103,12 @@ async def scenario_natural(check) -> None:
         # assistant 轮带 tool_calls
         asst = next(m for m in fake.turns[1] if m.role == "assistant")
         check(bool(asst.tool_calls), "assistant 轮携带 tool_calls 回传")
-        log_writes = [e.content for e in events if e.type == "log" and "写入页面" in e.content]
-        check(len(log_writes) == 2, f"两次写入各有 log：{log_writes}")
+        log_writes = [
+            e.content for e in events
+            if e.type == "log" and e.metadata.get("trace") == "action"
+            and e.content.startswith("write_file(")
+        ]
+        check(len(log_writes) == 2, f"两次写入各有 action log：{log_writes}")
 
 
 async def scenario_nudge_and_maxsteps(check) -> None:

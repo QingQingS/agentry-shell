@@ -15,6 +15,7 @@ index.md，把知识整合进以主题为中心的本地知识库。
 from __future__ import annotations
 
 import json
+import time
 from datetime import date
 from pathlib import Path
 from typing import AsyncIterator, List, Tuple
@@ -74,8 +75,10 @@ class WikiAgent(AgentInterface):
         final_content = ""
         stopped_naturally = False
 
-        for _step in range(MAX_STEPS):
+        for step in range(MAX_STEPS):
+            t0 = time.monotonic()
             resp = await llm.chat(messages, tools=specs)
+            dt = time.monotonic() - t0
             messages.append(
                 ChatMessage(
                     role="assistant",
@@ -84,8 +87,16 @@ class WikiAgent(AgentInterface):
                     reasoning_content=resp.reasoning_content,  # 思考模型回传约束
                 )
             )
-            if resp.content.strip():
-                yield AgentEvent(type="log", content=f"思考：{resp.content.strip()}")
+
+            # 思考轨迹：思考模型把推理链放在 reasoning_content（content 此时常为空）
+            think = (resp.reasoning_content or resp.content or "").strip()
+            if think:
+                yield AgentEvent(type="log", content=think, metadata={"trace": "think"})
+            yield AgentEvent(
+                type="log",
+                content=f"第 {step + 1} 步 · {dt:.1f}s · +{resp.usage.total_tokens} tokens",
+                metadata={"trace": "leaf"},
+            )
 
             if not resp.tool_calls:
                 final_content = resp.content
@@ -99,7 +110,13 @@ class WikiAgent(AgentInterface):
                 messages.append(ChatMessage(role="tool", content=obs, tool_call_id=call.id))
                 yield AgentEvent(
                     type="log",
-                    content=self._describe_call(call.name, call.arguments, obs),
+                    content=self._describe_action(call.name, call.arguments),
+                    metadata={"trace": "action"},
+                )
+                yield AgentEvent(
+                    type="log",
+                    content=self._summarize_obs(call.name, obs),
+                    metadata={"trace": "leaf"},
                 )
                 if call.name == "write_file" and not obs.startswith("Error:"):
                     path = call.arguments.get("path")
@@ -150,18 +167,29 @@ class WikiAgent(AgentInterface):
         return "\n".join(parts)
 
     @staticmethod
-    def _describe_call(name: str, args: dict, obs: str) -> str:
-        is_err = obs.startswith("Error:")
-        prefix = "✗ " if is_err else ""
+    def _describe_action(name: str, args: dict) -> str:
+        """工具调用的主行描述，形如 read_file(index.md)。"""
         if name == "read_file":
-            base = f"{prefix}读取页面 {args.get('path')}"
-        elif name == "write_file":
-            base = f"{prefix}写入页面 {args.get('path')}"
-        elif name == "list_files":
-            base = f"{prefix}列出页面" + (f"（{args.get('subdir')}）" if args.get("subdir") else "")
-        else:
-            base = f"{prefix}调用 {name}"
-        return f"{base} → {obs}" if is_err else base
+            return f"read_file({args.get('path')})"
+        if name == "write_file":
+            return f"write_file({args.get('path')})"
+        if name == "list_files":
+            sub = args.get("subdir")
+            return f"list_files({sub})" if sub else "list_files()"
+        return f"{name}({json.dumps(args, ensure_ascii=False)})"
+
+    @staticmethod
+    def _summarize_obs(name: str, obs: str) -> str:
+        """工具结果的缩进子行摘要（只给摘要，不把全文灌进 log）。"""
+        if obs.startswith("Error:"):
+            return f"✗ {obs}"
+        if name == "read_file":
+            return f"读取 {obs.count(chr(10)) + 1} 行 / {len(obs)} 字"
+        if name == "list_files":
+            if obs.startswith("("):       # "(wiki 内暂无 .md 页面)"
+                return obs
+            return f"列出 {obs.count(chr(10)) + 1} 个页面"
+        return obs                        # write_file 的 obs 已是简短摘要
 
     @staticmethod
     def _summarize(touched: List[str]) -> str:

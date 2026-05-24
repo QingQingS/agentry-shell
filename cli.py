@@ -79,7 +79,18 @@ async def run_task(task: str, config: Config) -> Optional[str]:
 def _print_event(event: AgentEvent) -> None:
     """将 AgentEvent 格式化输出到终端"""
     if event.type == "log":
-        print(f"  {dim('›')} {event.content}")
+        trace = event.metadata.get("trace")
+        if trace == "think":                       # ✻ 思考主行（多行对齐缩进）
+            lines = event.content.splitlines() or [""]
+            print(f"  {dim('✻')} {dim(lines[0])}")
+            for ln in lines[1:]:
+                print(f"    {dim(ln)}")
+        elif trace == "action":                    # ⏺ 工具调用主行
+            print(f"  {cyan('⏺')} {event.content}")
+        elif trace == "leaf":                       # ⎿ 结果/指标子行
+            print(f"    {dim('⎿')} {dim(event.content)}")
+        else:
+            print(f"  {dim('›')} {event.content}")
 
     elif event.type == "result":
         print(f"\n{bold(green('✅ 结果'))}")
