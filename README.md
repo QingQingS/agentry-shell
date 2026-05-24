@@ -52,6 +52,31 @@ User (CLI / Web UI / REST)
   `BaseRetriever`; agents loaded dynamically via `AGENT_CLASS`. Adding any of these touches no core code.
 - **Streaming first.** Token-level streaming over WebSocket, with per-session token accounting.
 
+## Optimizing the ReAct loop, measured
+
+`WikiAgent`'s tool loop was profiled and tuned with a measurement-first workflow: first an
+event-level trace (per-step reasoning, tool calls, timing, token deltas), then a fixed
+single-topic ingestion fixture so runs are comparable. Ingesting one document into a two-page
+wiki on that fixture:
+
+| Version | LLM round-trips | Tool calls | Total tokens |
+|---|---|---|---|
+| Baseline | 6 | read index · list · **read 2 unrelated pages** · write page · re-read index · write index | 28,264 |
+| + relevance judged from the index, read-to-update only | 4 | read index · list · write page · write index | 14,435 |
+| + code owns the index (LLM never reads/writes it) | **2** | write page | **7,943** |
+
+**−72% tokens, identical curation output.** Two findings shaped the work:
+
+- *Build the instrument first.* Single-run token counts on an ambiguous, multi-topic document were
+  dominated by curation variance (the model created 1 vs 3 pages run-to-run), swamping the signal.
+  A fixed single-topic fixture (`tests/fixtures/`, with a git-tracked baseline wiki and a one-command
+  reset) made each change's effect legible.
+- *A falsified hypothesis redirected the effort.* Pruning the model's accumulated `reasoning_content`
+  looked like the largest lever — but the thinking-mode API rejects any tool-call turn that drops it,
+  so the reasoning can't be removed from history. The effort shifted to removing the *turns* that
+  accumulate it: judging relevance from the index instead of reading pages, and pushing index
+  maintenance out of the loop into deterministic code.
+
 ## Quick start
 
 Requires Python ≥ 3.11.
