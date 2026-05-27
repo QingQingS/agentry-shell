@@ -1,8 +1,9 @@
 # 项目上下文
 
 > 用于对话重启时快速恢复进度。
-> 最近更新：2026-05-23
+> 最近更新：2026-05-24
 > 历史开发记录：`docs/archive/phase1-phase2-history.md`
+> WikiAgent 优化记录：`wiki_agent优化.md`
 
 ---
 
@@ -16,6 +17,11 @@
 阶段三 ✅  连续对话：session/intent/agent mode/orchestrator 全部实现，CLI 多轮 E2E 跑通（survey→chat→code_search，连续性+代词消解+落盘验证）。前端 B4 已修（追加式多轮历史），WS 单连接多轮已验证
 阶段四 ✅  WikiAgent（持久化 LLM 策展 Wiki，项目首个 agentic agent）——设计存档见 wiki-agent开发.md（七~十节）。Step A 中性类型 / B 工具路径（含思考模型 reasoning_content 回传坑）/ C core/tools.py 工具层+沙箱 / D agents/wiki_agent.py ReAct 循环+wiki_schema.py / E 接入 Orchestrator（intent 加 route=wiki 臂+files 字段，dispatch 透传 files）全部完成。离线全绿 + 真实 DeepSeek 跑通（WikiAgent 端到端归档；分类器 live 正确判 wiki）。
             ⚠ 已知边界：冷启动首轮（无 session 上下文）classify 跳过 LLM 降级 research，故「首条消息就归档 wiki」会落到 research（与 B9 同源）；自然流程「先研究→再归档」有上下文则正常命中 wiki。
+优化   ✅  WikiAgent ReAct 可观测化 + 性能调优（2026-05-24，详见 wiki_agent优化.md，已推 GitHub）：
+            ① 可观测性：surface reasoning_content 作思考 + 工具结果摘要 + 分步耗时/token，CLI 渲染 ✻/⏺/⎿ 缩进树。
+            ② 测量地基：稳定单主题 fixture（tests/fixtures/ingest_single_topic.md）+ git 化基线 wiki 快照 + sh tests/reset_wiki.sh 一键复位。
+            ③ Opt1（相关性靠 index 判断、全文只读待更新页）+ Opt2（index 交给代码 core/wiki_index.py，LLM 不读写 index）：稳定 fixture 实测 28264→14435→7943 token，**累计 −72%、零质量损失**。
+            ✗ Opt3 证伪：reasoning_content 不可裁剪（thinking 模式 API 要求每个带 tool_call 的历史轮都回传，否则 400）→ 杠杆转向「减少带 tool_call 的轮数」。
 ```
 
 ---
@@ -31,7 +37,8 @@ agent-shell/
 │   ├── stream.py              # ⚠ 死代码（待删）
 │   ├── session.py             # SessionManager + Session/Turn/ReportRecord + 窗口落盘（阶段三）
 │   ├── intent.py              # classify_intent → {route, mode, target, carry_context, files}（阶段三/四）
-│   ├── tools.py               # 阶段四：Tool/FileTool + read/write/list_files + ToolRegistry + ./wiki/ 沙箱
+│   ├── tools.py               # 阶段四：Tool/FileTool + read/write/list_files + ToolRegistry + ./wiki/ 沙箱（优化：硬挡写 index.md）
+│   ├── wiki_index.py          # 优化：index.md 代码侧投影（frontmatter 解析 + build_catalog 注入 / regenerate_index 重生成）
 │   ├── llm/
 │   │   ├── base.py            # BaseLLM / ChatMessage / LLMResponse / TokenUsage / ToolSpec / ToolCall（chat 支持 tools=）
 │   │   ├── openai_provider.py # OpenAIProvider + DeepSeekProvider（含工具路径 + reasoning_content 往返）
@@ -56,6 +63,7 @@ agent-shell/
 │   ├── app.py                 # FastAPI 路由
 │   └── websocket_manager.py   # WS 连接管理 + session token 累计
 ├── frontend/                  # HTML / JS / CSS
+├── tests/                     # check_*.py 离线验证脚本 + fixtures/（基线 wiki 快照 + 单主题测量 fixture）+ reset_wiki.sh
 ├── docs/archive/              # 历史设计记录（只查不改）
 ├── cli.py
 ├── main.py
@@ -327,6 +335,15 @@ Orchestrator `route=="wiki"` → WikiAgent.run(task, files=...)，不传 session
 - ChatAgent 查 wiki（读取/问答路由）= 后续阶段，未设计
 - 知识图谱（实体已在 frontmatter 留接口）= 后置
 
+### 6.6 优化（2026-05-24，完整记录见 `wiki_agent优化.md`，已推 GitHub）
+
+- **可观测性**：`wiki_agent.py` 循环 surface `reasoning_content` 作思考、每步发耗时+`resp.usage` 增量、每个工具调用配结果摘要；`cli.py` 按 `metadata.trace` 渲染 `✻`(思考)/`⏺`(工具)/`⎿`(结果·指标) 缩进树。无 trace 的旧 log 照旧。
+- **测量地基**：Musk fixture 跨主题、策展 run-to-run 波动（1 vs 3 页）淹没信号 → 改用 `tests/fixtures/ingest_single_topic.md`（RAG 单主题）+ `tests/fixtures/wiki_baseline/`（git 追踪）+ `sh tests/reset_wiki.sh`（一键复位）。协议：复位→跑单主题→比总 token。
+- **Opt 1**（SCHEMA）：相关性只凭 index 描述/实体判断，`read_file` 全文仅用于待更新页。稳定 fixture 28264→14435（−49%）。
+- **Opt 2**（代码接管 index）：`core/wiki_index.py` 从各页 frontmatter 建 catalog 注入 prompt + 收尾 `regenerate_index` 重生成 index.md；页面 frontmatter 加 `description` 字段；`WriteFileTool` 硬挡 index.md 写入。14435→7943（再 −45%）。**累计 −72%、零质量损失、index 零漂移。**
+- ✗ **Opt 3 证伪**：`reasoning_content` 不可裁剪（thinking 模式要求每个带 tool_call 历史轮都回传，否则 400）。剩余主导成本=模型海量思考（随任务歧义/页数波动），删不掉，只能靠减轮数。
+- 后续可选：curation run-to-run 一致性 / 减少模型纠结 / Musk 压力 fixture 回归验证 Opt1·2 鲁棒性。
+
 ---
 
 ## 七、待处理事项
@@ -362,13 +379,16 @@ Orchestrator `route=="wiki"` → WikiAgent.run(task, files=...)，不传 session
 请读取 CONTEXT.md 了解项目背景和进度。
 
 阶段一~四全部完成（基础架子 / 研究功能 / 连续对话 / WikiAgent）。
-WikiAgent（阶段四，项目首个 agentic agent）已可独立运行并接入编排（route=wiki）。
+WikiAgent（阶段四，项目首个 agentic agent）已可独立运行并接入编排（route=wiki），
+并已做可观测化 + 性能调优（见 §6.6，稳定 fixture 实测累计 −72% token，已推 GitHub）。
 
 下一步可选方向：
+  - WikiAgent 优化续：curation run-to-run 一致性 / 减少模型纠结 / Musk 压力 fixture 回归
   - 转阶段五（Memory/Storage 长期记忆）或其它
 
 待处理（Bug/埋雷）清单在 §七，目前选择"先开发再回头收"。
-设计讨论过程在 NOTES.md；阶段四开发讨论归档（已冻结）在 wiki-agent开发.md。
+设计讨论过程在 NOTES.md；阶段四开发讨论归档（已冻结）在 wiki-agent开发.md；
+WikiAgent 优化记录在 wiki_agent优化.md。
 历史开发记录在 docs/archive/phase1-phase2-history.md。
 ```
 

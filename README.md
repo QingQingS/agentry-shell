@@ -167,7 +167,7 @@ behind `core/llm/factory.py` and `BaseRetriever` the same way.
 
 ## Status & roadmap
 
-Actively developed as a learning / portfolio project. The agent runtime, multi-source research,
+Actively developed as a learning project. The agent runtime, multi-source research,
 continuous-conversation orchestration, and the ReAct WikiAgent are all implemented and runnable
 end-to-end against a real LLM.
 

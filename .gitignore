@@ -12,5 +12,8 @@ venv/
 reports/
 wiki/
 
+# 本地测试执行脚本（含个人路径，不入库）
+run.sh
+
 # macOS
 .DS_Store
