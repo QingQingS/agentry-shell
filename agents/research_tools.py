@@ -20,9 +20,11 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 import urllib.error
 import urllib.request
-from typing import List, Tuple
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 from core.llm import ChatMessage
 from core.llm.base import ToolSpec
@@ -268,11 +270,84 @@ class DoBroadSurveyTool(Tool):
         return lines[: cls.NUM_SUB_QUESTIONS]
 
 
-def build_research_registry(fast_llm, smart_llm, retrievers: List[BaseRetriever]) -> ToolRegistry:
+class SaveReportTool(Tool):
+    """ResearchAgent 末轮调用以落盘最终报告到 reports/。
+
+    跨 agent 数据通过文件系统传递（artifact-as-first-class）：本工具是 ResearchAgent
+    唯一的产出落点；Coordinator 拿到 artifact 路径后用 stage_files 把它转到
+    wiki/staging/，再派 wiki_curator。
+
+    保护：
+    - filename 必须以 .md 结尾，且不含路径分隔（/ \\）或 ..
+    - 同名冲突自动追加时间戳后缀
+    - 父目录自动创建
+    """
+
+    DEFAULT_ROOT = "reports"
+    OBS_PATTERN = re.compile(r"^已保存 (\S+)（\d+ 字符）$")
+
+    spec = ToolSpec(
+        name="save_report",
+        description=(
+            "把最终研究报告落盘到 reports/<filename>。filename 必须以 .md 结尾、"
+            "不含路径分隔或 ..；同名冲突时自动追加时间戳。"
+            "完成本调用后请直接结束（下一轮不要再调任何工具）。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "filename": {"type": "string", "description": "报告文件名（如 rl-survey.md）"},
+                "content": {"type": "string", "description": "报告完整 markdown 内容"},
+            },
+            "required": ["filename", "content"],
+        },
+    )
+
+    def __init__(self, root: Optional[Path] = None):
+        self.root = (Path(root) if root else Path(self.DEFAULT_ROOT)).resolve()
+
+    async def execute(self, filename: str, content: str) -> str:
+        if not filename:
+            return "Error: filename 不能为空"
+        if "/" in filename or "\\" in filename or ".." in filename:
+            return f"Error: filename 不允许包含路径分隔或 ..: {filename}"
+        if not filename.endswith(".md"):
+            return f"Error: filename 必须以 .md 结尾: {filename}"
+        self.root.mkdir(parents=True, exist_ok=True)
+        target = self.root / filename
+        if target.exists():
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            target = self.root / f"{target.stem}-{ts}.md"
+        target.write_text(content, encoding="utf-8")
+        display = self._display_path(target)
+        return f"已保存 {display}（{len(content)} 字符）"
+
+    @staticmethod
+    def _display_path(p: Path) -> str:
+        """优先用相对 cwd 的路径，便于下游 stage_files 引用。"""
+        try:
+            return str(p.relative_to(Path.cwd()))
+        except ValueError:
+            return str(p)
+
+    @classmethod
+    def parse_obs_path(cls, obs: str) -> Optional[str]:
+        """从 obs 文本提取 save_report 实际写入的路径（供 ResearchAgent 循环读取）。"""
+        m = cls.OBS_PATTERN.match(obs.strip())
+        return m.group(1) if m else None
+
+
+def build_research_registry(
+    fast_llm,
+    smart_llm,
+    retrievers: List[BaseRetriever],
+    reports_root: Optional[Path] = None,
+) -> ToolRegistry:
     """造 ResearchAgent 私有工具注册表。
 
     retrievers 必须至少一个（ResearchAgent._make_retrievers 兜底 ArxivRetriever）。按 source
     分配给原子工具（arxiv → search_papers，tavily → search_web）；do_broad_survey 用全部并发。
+    save_report 写 reports_root/<filename>（默认 ./reports/）。
     """
     arxiv_r = next((r for r in retrievers if r.source_name == "arxiv"), retrievers[0])
     tavily_r = next((r for r in retrievers if r.source_name == "tavily"), arxiv_r)
@@ -281,4 +356,5 @@ def build_research_registry(fast_llm, smart_llm, retrievers: List[BaseRetriever]
         SearchWebTool(tavily_r),
         FetchUrlTool(),
         DoBroadSurveyTool(fast_llm, smart_llm, retrievers),
+        SaveReportTool(reports_root),
     ])

@@ -17,8 +17,10 @@ v2 Step 2 验证脚本 —— CoordinatorAgent ReAct 循环（离线）。
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -184,6 +186,36 @@ async def main() -> None:
     assert res.content, "触顶也应有兜底 result"
     # 触顶意味着 echo 被派发了 MAX_ROUNDS 次
     assert res.metadata.get("spokes_used") == ["echo"] * MAX_ROUNDS, res.metadata.get("spokes_used")
+
+    # 8) 本地工具与 dispatch 混排：import_files → stage_files → dispatch_agent → text
+    #    验证 import/stage 不计入 spokes_used；本地工具 obs 也正常回填到对话历史。
+    with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp):
+        ext = Path(tmp) / "ext.md"
+        ext.write_text("外部文档", encoding="utf-8")
+
+        events = await collect(
+            [
+                tool_resp(tc("import_files", paths=[str(ext)])),
+                tool_resp(tc("stage_files", paths=["uploads/ext.md"])),
+                tool_resp(tc("dispatch_agent", agent="echo",
+                             prompt="归档 staging/ext.md")),
+                text_resp("## 完成\n外部文档已入库并派给 echo 处理。"),
+            ],
+            registry=reg, task="把 ext.md 入库并处理",
+        )
+        res = result_event(events)
+        assert res.content.startswith("## 完成"), res.content
+        assert res.metadata.get("spokes_used") == ["echo"], \
+            f"本地工具不应计入 spokes_used：{res.metadata.get('spokes_used')}"
+        # 文件流真实发生
+        assert Path("uploads/ext.md").is_file(), "import_files 真实复制到 uploads/"
+        assert Path("wiki/staging/ext.md").is_file(), "stage_files 真实复制到 wiki/staging/"
+        # action 日志正确标注工具名（非 dispatch 时用 call.name 作 label）
+        action_labels = [e.metadata.get("spoke") for e in events
+                         if e.metadata.get("trace") == "action"]
+        assert "import_files" in action_labels, f"action 缺 import_files：{action_labels}"
+        assert "stage_files" in action_labels, f"action 缺 stage_files：{action_labels}"
+        assert "echo" in action_labels, f"action 缺 echo：{action_labels}"
 
     print("OK")
 

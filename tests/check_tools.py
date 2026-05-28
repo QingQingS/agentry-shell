@@ -44,7 +44,8 @@ async def main() -> int:
         print("[冷启动]")
         check((wiki / "index.md").is_file(), "首次构造种入了 index.md 骨架")
         names = sorted(s.name for s in reg.specs())
-        check(names == ["list_files", "read_file", "write_file"], f"specs() 暴露 3 工具: {names}")
+        check(names == ["list_files", "read_file", "read_source", "write_file"],
+              f"specs() 暴露 4 工具: {names}")
 
         print("\n[读写往返 + 自动建父目录]")
         r = await reg.execute(call("write_file", path="AI/transformer.md", content="# Transformer\n注意力机制"))

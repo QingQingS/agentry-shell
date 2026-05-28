@@ -29,6 +29,7 @@ from core.agent_interface import AgentEvent, AgentInterface
 from core.dispatch import DispatchAgentTool
 from core.llm import ChatMessage, get_llm
 from core.registry import AgentRegistry, build_default_registry
+from core.staging import ImportFilesTool, StageFilesTool
 from core.tools import ToolRegistry
 
 MAX_ROUNDS = 10          # Coordinator 派发轮上限（防递归式无限分解）
@@ -42,15 +43,33 @@ SCHEMA_TEMPLATE = """你是一个任务编排中枢（Coordinator）。你把用
 可用的 agent：
 {catalog}
 
-派发方式——调用 dispatch_agent(agent, prompt, context)：
-- agent：上面清单里的名字。
-- prompt：给该 agent 的自然语言子任务，必须自包含、指代已消解（agent 看不到本对话历史）。
-- context：可选背景，用于把上游 agent 的结果蒸馏后传给下游；无则留空。
+可用的工具：
+
+- dispatch_agent(agent, prompt, context): 把子任务派给一个 spoke。
+  - agent：上面清单里的名字。
+  - prompt：给该 agent 的自然语言子任务，必须自包含、指代已消解（agent 看不到本对话历史）。
+  - context：可选背景，用于把上游 agent 的结果蒸馏后传给下游；无则留空。
+  - 返回 observation 含 status / summary / artifact 行（如果 spoke 落盘了产物，路径写在这里）/ report 段。
+
+- import_files(paths): 把用户提到的外部文件复制到 uploads/。
+  paths 是用户给的外部路径列表（绝对或 ~ 路径）。返回每个文件入库后的工作区路径。
+  **下游 spoke 永远不直接读外部 path**——任何外部文件必须先经 import_files 进入工作区。
+
+- stage_files(paths): 把 reports/ 或 uploads/ 下的文件复制到 wiki/staging/。
+  paths 必须以 reports/ 或 uploads/ 开头。返回 staging/ 内路径列表。
+  **派 wiki_curator 前必须先调本工具**——wiki_curator 只能读 staging/。
+
+跨 agent 数据流的标准模式：
+
+- 调研任务：dispatch_agent(researcher, ...) → 拿到 artifact: reports/xxx.md（researcher 强制落盘）。
+- 归档 researcher 的产出：stage_files(["reports/xxx.md"]) → dispatch_agent(wiki_curator,
+  "归档 staging/ 下的 xxx.md")。
+- 归档用户提供的外部文件：import_files([...]) → stage_files([...]) → dispatch_agent(wiki_curator, ...)。
+- 简单追问能直接答 → 不必派发。
 
 分解原则：
 - 子任务之间无依赖 → 可在一轮里发出多个 dispatch_agent（并行）。
-- 有依赖（下游 prompt 需要上游结果）→ 先发上游，拿到返回后再发下游。
-- 能直接用已有信息回答的简单追问 → 不必派发，直接作答。
+- 有依赖（下游 prompt 需要上游 artifact 路径）→ 先发上游，拿到 artifact 再发下游。
 
 结束：当你拿到足够信息后，**不要再调用工具**，直接输出给用户的最终答复。
 最终答复用 Markdown 正文，面向用户，不要输出 JSON、不要复述工具调用细节。
@@ -65,7 +84,9 @@ class CoordinatorAgent(AgentInterface):
         # 生命周期/异常→error 由 core.runner 统一负责；这里只 yield 领域事件、失败时抛异常。
         registry: AgentRegistry = kwargs.get("registry") or build_default_registry()
         dispatch = DispatchAgentTool(registry, config=self.config, websocket=self.websocket)
-        tools = ToolRegistry([dispatch])
+        import_tool = ImportFilesTool()
+        stage_tool = StageFilesTool()
+        tools = ToolRegistry([dispatch, import_tool, stage_tool])
         specs = tools.specs()
 
         llm = get_llm(tier="smart", config=self.config)
@@ -111,41 +132,51 @@ class CoordinatorAgent(AgentInterface):
                 stopped_naturally = True
                 break
 
-            # 并行扇入：本轮所有 tool_call 并发驱动，各 spoke 事件合并成一条流（带 spoke_id）。
+            # 并行扇入：本轮所有 tool_call 并发驱动。
+            # 两类调用混排：dispatch_agent → spoke 派发（事件流扇入）；
+            #             import_files / stage_files → 本地工具，直接 execute。
             indexed = []
             for idx, call in enumerate(resp.tool_calls):
-                agent_name = call.arguments.get("agent", "?")
-                spoke_id = f"{agent_name}#{idx}"
-                indexed.append((call, agent_name, spoke_id))
+                if call.name == "dispatch_agent":
+                    kind = "dispatch"
+                    label = call.arguments.get("agent", "?")
+                    action_text = f"dispatch_agent({label})"
+                else:
+                    kind = "local"
+                    label = call.name
+                    paths_count = len(call.arguments.get("paths", []) or [])
+                    action_text = f"{call.name}({paths_count} paths)" if paths_count else call.name
+                spoke_id = f"{label}#{idx}"
+                indexed.append((call, kind, label, spoke_id))
                 yield AgentEvent(
                     type="log",
-                    content=f"dispatch_agent({agent_name})",
-                    metadata={"trace": "action", "spoke": agent_name, "spoke_id": spoke_id},
+                    content=action_text,
+                    metadata={"trace": "action", "spoke": label, "spoke_id": spoke_id},
                 )
 
             queue: asyncio.Queue = asyncio.Queue()
             done = object()
 
-            async def run_one(call, agent_name, spoke_id):
-                if call.name != "dispatch_agent":
-                    return f"Error: 未知工具: {call.name}"
-
-                async def on_event(ev):
-                    if ev.type in _FORWARD_EVENT_TYPES:
-                        await queue.put((spoke_id, agent_name, ev))
-
-                try:
-                    return await dispatch.dispatch(
-                        agent_name,
-                        call.arguments.get("prompt", ""),
-                        call.arguments.get("context", ""),
-                        on_event=on_event,
-                    )
-                except Exception as e:  # spoke 构造/驱动意外也不打断循环
-                    return f"Error: 派发 {agent_name} 失败: {type(e).__name__}: {e}"
+            async def run_one(call, kind, label, spoke_id):
+                if kind == "dispatch":
+                    async def on_event(ev):
+                        if ev.type in _FORWARD_EVENT_TYPES:
+                            await queue.put((spoke_id, label, ev))
+                    try:
+                        return await dispatch.dispatch(
+                            label,
+                            call.arguments.get("prompt", ""),
+                            call.arguments.get("context", ""),
+                            on_event=on_event,
+                        )
+                    except Exception as e:  # spoke 构造/驱动意外也不打断循环
+                        return f"Error: 派发 {label} 失败: {type(e).__name__}: {e}"
+                # 本地工具（import_files / stage_files / 未知）走 ToolRegistry，
+                # 任何异常已被 ToolRegistry.execute 兜成 observation。
+                return await tools.execute(call)
 
             async def drive():
-                obs = await asyncio.gather(*(run_one(c, a, s) for c, a, s in indexed))
+                obs = await asyncio.gather(*(run_one(c, k, l, s) for c, k, l, s in indexed))
                 await queue.put(done)
                 return obs
 
@@ -162,14 +193,14 @@ class CoordinatorAgent(AgentInterface):
                 )
             observations = await driver
 
-            for (call, agent_name, spoke_id), obs in zip(indexed, observations):
-                if not obs.startswith("Error:"):
-                    spokes_used.append(agent_name)
+            for (call, kind, label, spoke_id), obs in zip(indexed, observations):
+                if kind == "dispatch" and not obs.startswith("Error:"):
+                    spokes_used.append(label)
                 messages.append(ChatMessage(role="tool", content=obs, tool_call_id=call.id))
                 yield AgentEvent(
                     type="log",
                     content=obs.splitlines()[0] if obs else "(空)",
-                    metadata={"trace": "leaf", "spoke": agent_name, "spoke_id": spoke_id},
+                    metadata={"trace": "leaf", "spoke": label, "spoke_id": spoke_id},
                 )
 
         usage = llm.cumulative_usage

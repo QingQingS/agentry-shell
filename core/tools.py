@@ -133,6 +133,60 @@ class ListFilesTool(FileTool):
         return "\n".join(rels)
 
 
+class ReadSourceTool(FileTool):
+    """读取 wiki/staging/ 下的待归档原文（受 wiki 沙箱保护 + 强制 staging/ 子目录）。
+
+    跨 agent 的「待归档原料」走文件系统传递：
+      - 用户外部文件 → uploads/ → stage_files → wiki/staging/ → 本工具
+      - ResearchAgent 产出 → reports/ → stage_files → wiki/staging/ → 本工具
+    任何原料都必须先经 stage_files 进入 staging/，本工具是 WikiAgent 看到「外界」
+    的唯一入口；沙箱原则保持不破。
+
+    限制：
+    - path 必须以 staging/ 开头（沙箱外的兄弟目录会被拒绝）
+    - 后缀白名单（.md/.markdown/.txt/.rst）—— stage 时也应已校验，这里防御性兜底
+    - 单文件大小上限 MAX_BYTES
+    """
+
+    MAX_BYTES = 1024 * 1024  # 1 MiB
+    ALLOWED_SUFFIXES = {".md", ".markdown", ".txt", ".rst"}
+    STAGING_PREFIX = "staging/"
+
+    spec = ToolSpec(
+        name="read_source",
+        description=(
+            "读取 wiki/staging/ 下的待归档文本文件（只读）。"
+            "path 相对 wiki 根，必须以 staging/ 开头（如 staging/foo.md）。"
+            "配合 list_files('staging') 使用，可看到当前 staging 里有哪些待归档原料。"
+            "支持 .md/.markdown/.txt/.rst；单文件上限 1 MiB。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "相对 wiki 根的路径，必须以 staging/ 开头",
+                }
+            },
+            "required": ["path"],
+        },
+    )
+
+    async def execute(self, path: str) -> str:
+        if not path.startswith(self.STAGING_PREFIX):
+            return f"Error: read_source 只允许读 staging/ 下的文件，拒绝: {path}"
+        p = self._resolve(path)  # 沙箱校验：落入 wiki_root 内
+        if not p.is_file():
+            return f"Error: 文件不存在: {path}"
+        if p.suffix.lower() not in self.ALLOWED_SUFFIXES:
+            allowed = ", ".join(sorted(self.ALLOWED_SUFFIXES))
+            return f"Error: 只允许读取文本文件（{allowed}），拒绝: {path}"
+        size = p.stat().st_size
+        if size > self.MAX_BYTES:
+            return f"Error: 文件 {path} 大小 {size} 字节超过上限 {self.MAX_BYTES}"
+        return p.read_text(encoding="utf-8")
+
+
 class ToolRegistry:
     """按 name 持有工具；对 ReAct 循环暴露 specs() 与 execute(call)。"""
 
@@ -177,5 +231,5 @@ def build_wiki_registry(wiki_root: Path) -> ToolRegistry:
         index.write_text(WIKI_INDEX_SKELETON, encoding="utf-8")
     root = wiki_root.resolve()
     return ToolRegistry(
-        [ReadFileTool(root), WriteFileTool(root), ListFilesTool(root)]
+        [ReadFileTool(root), WriteFileTool(root), ListFilesTool(root), ReadSourceTool(root)]
     )

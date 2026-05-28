@@ -23,9 +23,10 @@ import json
 import re
 import time
 from datetime import date
-from typing import AsyncIterator, List
+from pathlib import Path
+from typing import AsyncIterator, List, Optional
 
-from agents.research_tools import build_research_registry
+from agents.research_tools import SaveReportTool, build_research_registry
 from core.agent_interface import AgentEvent, AgentInterface
 from core.llm import ChatMessage, get_llm
 from core.retrievers import ArxivRetriever, BaseRetriever, TavilyRetriever
@@ -45,15 +46,19 @@ SYSTEM_PROMPT_TEMPLATE = """你是研究助理。手头有这些工具可用：
 - fetch_url(url, max_chars): 抓取指定 URL 的文本内容（HTML 去 tag 后返回）。用于读特定论文 / 看某个 README。
 - do_broad_survey(topic, background): 对一个主题做广度调研（拆问 → 多源并发检索 → 综合），返回完整 markdown 报告。
   适合「调研 X 最新进展」这类宽问题——一次调用拿到结构化产出。
+- save_report(filename, content): 把最终 markdown 报告落盘到 reports/<filename>。filename 要含主题
+  slug（如 rl-survey.md / vllm-analysis.md），便于下游识别。
 
 工作流程：
-1. 看用户的研究任务，自主决定调用哪些工具。
+1. 看用户的研究任务，自主决定调用哪些检索工具。
    - 宽调研 → 通常一次 do_broad_survey 就够（也可以再补充 search/fetch 修补具体点）。
    - 找开源实现 → search_web 优先。
    - 读特定论文 / 看 README → fetch_url 抓全文。
    - 自己拆细问题分别查 → 多次 search_papers。
-2. 完成后，直接用 markdown 写出最终研究报告：开头一段总览，分点论述，结论收尾。
-   报告之后不要再调用工具——这是循环结束信号。
+2. 写最终 markdown 报告：开头一段总览，分点论述，结论收尾。
+3. **必须调 save_report(filename, content=完整报告) 把报告落盘**——这是契约要求，
+   Coordinator 要拿落盘路径转交给下游 agent；不落盘等于工作未完成。
+4. save_report 调完后，下一轮直接结束（不要再调任何工具；text content 简短确认即可）。
 
 今天的日期：{today}
 """
@@ -67,11 +72,12 @@ class ResearchAgent(AgentInterface):
         # 生命周期与异常→error 由 core.runner 统一负责；这里只 yield 领域事件、失败时抛异常。
         # context 是新接口；旧 v1 OrchestratorAgent 仍传 background_context（cutover 时删）。
         background = (kwargs.get("context") or kwargs.get("background_context") or "").strip()
+        reports_root = Path(kwargs.get("reports_root") or SaveReportTool.DEFAULT_ROOT)
 
         fast = get_llm(tier="fast", config=self.config)
         smart = get_llm(tier="smart", config=self.config)
         retrievers = self._make_retrievers()
-        registry = build_research_registry(fast, smart, retrievers)
+        registry = build_research_registry(fast, smart, retrievers, reports_root=reports_root)
         specs = registry.specs()
 
         yield AgentEvent(
@@ -96,10 +102,11 @@ class ResearchAgent(AgentInterface):
 
         call_counts: dict = {}
         nudged = False
-        retrieval_calls = 0      # 工具调用总数
-        retrieval_hits = 0       # 非空（非 Error/非「(...)」开头）的工具结果数
+        retrieval_calls = 0      # 工具调用总数（不含 save_report）
+        retrieval_hits = 0       # 非空（非 Error/非「(...)」开头）的检索结果数
         final_content = ""
         stopped_naturally = False
+        artifact_path: Optional[str] = None   # LLM 调 save_report 时由代码从 obs 解析
 
         for step in range(MAX_STEPS):
             t0 = time.monotonic()
@@ -122,7 +129,9 @@ class ResearchAgent(AgentInterface):
             )
 
             if not resp.tool_calls:
-                final_content = resp.content
+                # save_report 已提供过权威 content 则不覆盖；否则用本轮 text 兜底
+                if not final_content:
+                    final_content = resp.content
                 stopped_naturally = True
                 break
 
@@ -141,9 +150,19 @@ class ResearchAgent(AgentInterface):
                     content=self._summarize_obs(call.name, obs),
                     metadata={"trace": "leaf"},
                 )
-                retrieval_calls += 1
-                if not self._is_empty_obs(obs):
-                    retrieval_hits += 1
+                if call.name == "save_report":
+                    # save_report 不算检索；从 obs 解析实际写入路径
+                    # （LLM 多次调用时取最后一次成功的；其 content 是权威报告内容）
+                    parsed = SaveReportTool.parse_obs_path(obs)
+                    if parsed:
+                        artifact_path = parsed
+                        content_arg = call.arguments.get("content", "")
+                        if content_arg:
+                            final_content = content_arg
+                else:
+                    retrieval_calls += 1
+                    if not self._is_empty_obs(obs):
+                        retrieval_hits += 1
 
             if not nudged and any(c >= DUP_THRESHOLD for c in call_counts.values()):
                 messages.append(ChatMessage(role="user", content=NUDGE_TEXT))
@@ -154,6 +173,15 @@ class ResearchAgent(AgentInterface):
             yield AgentEvent(type="log", content=f"达到步数上限（{MAX_STEPS}），提前结束。")
             if not final_content:
                 final_content = "（因达步数上限未能写出完整报告。）"
+
+        # 落盘兜底：LLM 未调 save_report（漏调或触顶提前结束）时，由代码强制落盘 final_content。
+        # 跨 agent 数据走文件系统的契约不能由 LLM 单方面打破，所以必须有 artifact。
+        if artifact_path is None and final_content.strip():
+            artifact_path = self._fallback_save(reports_root, task, final_content)
+            yield AgentEvent(
+                type="log",
+                content=f"LLM 未调 save_report，代码兜底落盘 → {artifact_path}",
+            )
 
         total = fast.cumulative_usage + smart.cumulative_usage
         yield AgentEvent(
@@ -167,10 +195,13 @@ class ResearchAgent(AgentInterface):
             status, summary = "degenerate", "（未检索到相关结果）"
         else:
             status, summary = "ok", self._first_paragraph(final_content)
+        result_meta = {"status": status, "summary": summary}
+        if artifact_path:
+            result_meta["artifact_path"] = artifact_path
         yield AgentEvent(
             type="result",
             content=final_content,
-            metadata={"status": status, "summary": summary},
+            metadata=result_meta,
         )
 
     # ---- 辅助 ----
@@ -208,6 +239,8 @@ class ResearchAgent(AgentInterface):
             return f"fetch_url({args.get('url')})"
         if name == "do_broad_survey":
             return f"do_broad_survey({args.get('topic')!r})"
+        if name == "save_report":
+            return f"save_report({args.get('filename')!r})"
         return f"{name}({json.dumps(args, ensure_ascii=False)})"
 
     @staticmethod
@@ -220,9 +253,29 @@ class ResearchAgent(AgentInterface):
             return f"得到 broad_survey 报告 / {len(obs)} 字"
         if name == "fetch_url":
             return f"抓到 {len(obs)} 字"
+        if name == "save_report":
+            return obs   # 已是 "已保存 reports/xxx.md（n 字符）"
         # search_papers / search_web：用 `\n\n` 计条数
         n = obs.count("\n\n") + 1
         return f"得到 {n} 条结果 / {len(obs)} 字"
+
+    @staticmethod
+    def _fallback_save(reports_root: Path, task: str, content: str) -> str:
+        """LLM 漏调 save_report 时的兜底落盘。
+
+        文件名生成：task 前 30 字符的 slug + 时间戳后缀，避免与 LLM 主动落盘冲突。
+        路径返回相对 cwd（方便 Coordinator 后续 stage_files 引用）。
+        """
+        slug = re.sub(r"[^\w\-]+", "-", task[:30]).strip("-").lower() or "report"
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        root = Path(reports_root).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        target = root / f"auto-{slug}-{ts}.md"
+        target.write_text(content, encoding="utf-8")
+        try:
+            return str(target.relative_to(Path.cwd()))
+        except ValueError:
+            return str(target)
 
     @staticmethod
     def _first_paragraph(text: str) -> str:

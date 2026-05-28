@@ -1,11 +1,13 @@
 """
 WikiAgent —— 项目首个真正 agentic 的 Agent（ReAct 工具循环）。
 
-接收一份或多份 .md 文档，由 LLM 自主决定读哪些 wiki 页、写哪些页、怎么更新
-index.md，把知识整合进以主题为中心的本地知识库。
+接收自然语言归档指令（可携带上游背景），LLM 自主决定读哪些 wiki 页、写哪些页、
+是否要 read_source 取外部原文，把知识整合进以主题为中心的本地知识库。
 
 设计存档见 wiki-agent开发.md 第八（工具层）/九（SCHEMA）/十（循环兜底）节。
 关键约束：
+  - 入口契约：(task, context=...) 与 ResearchAgent/ChatAgent 对齐；
+    task 是自然语言指令，content 已在 prompt/context 里就直接归档，只给路径就让 LLM 调 read_source。
   - SCHEMA 进 system prompt；工具来自 core/tools.py 的沙箱注册表
   - assistant 工具调用轮必须回传 reasoning_content（思考模型要求，否则 400）
   - 工具永不抛异常（返回 observation 字符串）；循环只在「无 tool_call」或触顶 MAX_STEPS 时停
@@ -18,7 +20,7 @@ import json
 import time
 from datetime import date
 from pathlib import Path
-from typing import AsyncIterator, List, Tuple
+from typing import AsyncIterator, List
 
 from core.agent_interface import AgentEvent, AgentInterface
 from core.llm import ChatMessage, get_llm
@@ -43,17 +45,7 @@ class WikiAgent(AgentInterface):
 
     async def run(self, task: str, **kwargs) -> AsyncIterator[AgentEvent]:
         # 生命周期/异常→error 由 core.runner 统一负责；这里只 yield 领域事件、失败时抛异常。
-        files = self._resolve_input_paths(task, kwargs)
-        docs: List[Tuple[str, str]] = []
-        for p in files:
-            if p.is_file():
-                docs.append((p.name, p.read_text(encoding="utf-8")))
-                yield AgentEvent(type="log", content=f"读取输入文档：{p.name}")
-            else:
-                yield AgentEvent(type="log", content=f"输入文档不存在，跳过：{p}")
-        if not docs:
-            raise ValueError("没有可读的输入 .md 文档")
-
+        context = (kwargs.get("context") or "").strip()
         wiki_root = Path(kwargs.get("wiki_root") or DEFAULT_WIKI_ROOT)
         registry = build_wiki_registry(wiki_root)
         specs = registry.specs()
@@ -63,12 +55,14 @@ class WikiAgent(AgentInterface):
             content=f"使用 {llm.provider_name} / {llm.model}；wiki 根目录：{wiki_root.resolve()}",
             metadata={"provider": llm.provider_name, "model": llm.model},
         )
+        if context:
+            yield AgentEvent(type="log", content="（携带上游背景）")
 
         today = date.today().isoformat()
         catalog = build_catalog(wiki_root)   # 代码侧目录，注入 prompt（LLM 不再读 index.md）
         messages = [
             ChatMessage(role="system", content=WIKI_SCHEMA),
-            ChatMessage(role="user", content=self._format_input(docs, today, catalog)),
+            ChatMessage(role="user", content=self._format_input(today, catalog, context, task)),
         ]
 
         touched: List[str] = []          # 本次成功写入/更新的页面（去重前）
@@ -158,23 +152,19 @@ class WikiAgent(AgentInterface):
     # ---- 辅助 ----
 
     @staticmethod
-    def _resolve_input_paths(task: str, kwargs: dict) -> List[Path]:
-        """优先取 kwargs['files']（Orchestrator 传 payload）；否则把 task 当空白分隔的路径。"""
-        files = kwargs.get("files")
-        if files:
-            return [Path(f) for f in files]
-        return [Path(tok) for tok in task.split() if tok.strip()]
-
-    @staticmethod
-    def _format_input(docs: List[Tuple[str, str]], today: str, catalog: str) -> str:
+    def _format_input(today: str, catalog: str, context: str, task: str) -> str:
         parts = [
             f"今天的日期是 {today}。",
             "\nwiki 当前目录（系统维护，据此了解已有类别与页面；不必读 index.md）：",
             catalog,
-            f"\n下面是待归档的 {len(docs)} 份文档，请整合进 wiki：",
         ]
-        for name, content in docs:
-            parts.append(f"\n===== 文档：{name} =====\n{content}\n===== 文档结束：{name} =====")
+        if context:
+            parts.append(
+                "\n上游背景（供归档参考；若上游已含完整文档原文，直接基于此归档，不要再调 read_source）："
+            )
+            parts.append(context)
+        parts.append("\n用户的归档指令：")
+        parts.append(task or "（空——先用 list_files 看现状再决定下一步）")
         return "\n".join(parts)
 
     @staticmethod
@@ -187,6 +177,8 @@ class WikiAgent(AgentInterface):
         if name == "list_files":
             sub = args.get("subdir")
             return f"list_files({sub})" if sub else "list_files()"
+        if name == "read_source":
+            return f"read_source({args.get('path')})"
         return f"{name}({json.dumps(args, ensure_ascii=False)})"
 
     @staticmethod
@@ -196,6 +188,8 @@ class WikiAgent(AgentInterface):
             return f"✗ {obs}"
         if name == "read_file":
             return f"读取 {obs.count(chr(10)) + 1} 行 / {len(obs)} 字"
+        if name == "read_source":
+            return f"读取外部源 {obs.count(chr(10)) + 1} 行 / {len(obs)} 字"
         if name == "list_files":
             if obs.startswith("("):       # "(wiki 内暂无 .md 页面)"
                 return obs

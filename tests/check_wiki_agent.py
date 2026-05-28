@@ -74,8 +74,6 @@ def patch_llm(fake: FakeLLM):
 async def scenario_natural(check) -> None:
     print("\n[场景1] 自然停止（Opt2 流程）：注入 catalog → list → 写页 → 系统重生成 index → 收尾")
     with tempfile.TemporaryDirectory() as tmp:
-        src = Path(tmp) / "transformer_note.md"
-        src.write_text("# Transformer\n注意力机制是核心。", encoding="utf-8")
         wiki = Path(tmp) / "wiki"
 
         page = ("---\ntitle: Transformer\ncategory: AI\n"
@@ -88,7 +86,11 @@ async def scenario_natural(check) -> None:
         ])
         patch_llm(fake)
 
-        events = await collect(WikiAgent(config=None), files=[str(src)], wiki_root=str(wiki))
+        events = await collect(
+            WikiAgent(config=None),
+            task="归档以下 Transformer 笔记到 wiki：注意力机制是核心。",
+            wiki_root=str(wiki),
+        )
         types = [e.type for e in events]
         result = next((e.content for e in events if e.type == "result"), None)
 
@@ -97,9 +99,10 @@ async def scenario_natural(check) -> None:
         check(result == "完成：新建 AI/transformer.md。", f"自然停止取 LLM 末轮 content 作 result：{result!r}")
         check("result" in types and types.count("result") == 1, "恰好一个 result 事件")
         check(any(e.type == "tokens" for e in events), "有 tokens 事件")
-        # 第 1 轮 user 消息注入了 catalog（LLM 无需读 index.md）
+        # 第 1 轮 user 消息注入了 catalog 与归档指令（LLM 无需读 index.md）
         first_user = next(m for m in fake.turns[0] if m.role == "user")
         check("wiki 当前目录" in first_user.content, "开局 prompt 注入了 catalog")
+        check("归档以下 Transformer 笔记" in first_user.content, "开局 prompt 含用户的归档指令")
         # index.md 由代码从 frontmatter 重生成（含描述），非 LLM 所写
         idx = (wiki / "index.md").read_text(encoding="utf-8")
         check("[Transformer](AI/transformer.md)" in idx and "注意力机制综述" in idx,
@@ -115,8 +118,6 @@ async def scenario_natural(check) -> None:
 async def scenario_index_blocked(check) -> None:
     print("\n[场景4] index.md 硬挡：LLM 写 index 被拒，但系统仍从 frontmatter 重生成")
     with tempfile.TemporaryDirectory() as tmp:
-        src = Path(tmp) / "note.md"
-        src.write_text("# RAG\n检索增强生成。", encoding="utf-8")
         wiki = Path(tmp) / "wiki"
 
         page = ("---\ntitle: RAG\ncategory: AI\ndescription: 检索增强生成\n"
@@ -128,7 +129,7 @@ async def scenario_index_blocked(check) -> None:
         ])
         patch_llm(fake)
 
-        events = await collect(WikiAgent(config=None), files=[str(src)], wiki_root=str(wiki))
+        events = await collect(WikiAgent(config=None), task="归档 RAG 笔记。", wiki_root=str(wiki))
         # 写 index.md 的那次工具结果应是 Error（被硬挡）
         leaf_after_index = [
             e.content for e in events
@@ -143,14 +144,12 @@ async def scenario_index_blocked(check) -> None:
 async def scenario_nudge_and_maxsteps(check) -> None:
     print("\n[场景2] 兜圈子：永远重复同一调用 → nudge 一次 + MAX_STEPS 触顶")
     with tempfile.TemporaryDirectory() as tmp:
-        src = Path(tmp) / "doc.md"
-        src.write_text("内容", encoding="utf-8")
         wiki = Path(tmp) / "wiki"
 
         fake = FakeLLM([tool_resp(tc("list_files"))])  # 脚本耗尽后一直重复 list_files
         patch_llm(fake)
 
-        events = await collect(WikiAgent(config=None), files=[str(src)], wiki_root=str(wiki))
+        events = await collect(WikiAgent(config=None), task="归档某文档。", wiki_root=str(wiki))
         nudge_logs = [e for e in events if e.type == "log" and "nudge" in e.content]
         result = next((e.content for e in events if e.type == "result"), None)
 
@@ -165,16 +164,71 @@ async def scenario_nudge_and_maxsteps(check) -> None:
         check(any(e.type == "log" and "步数上限" in e.content for e in events), "有触顶 warning 日志")
 
 
-async def scenario_no_input(check) -> None:
-    print("\n[场景3] 无可读输入文档 → 抛 ValueError")
-    fake = FakeLLM([text_resp("x")])
-    patch_llm(fake)
-    raised = False
-    try:
-        await collect(WikiAgent(config=None), files=["/nonexistent/nope.md"])
-    except ValueError:
-        raised = True
-    check(raised, "无可读文档时 run() 抛 ValueError（交 runner 兜）")
+async def scenario_read_source(check) -> None:
+    print("\n[场景3] read_source：从 staging/ 取已 stage 的原料 → 写页")
+    with tempfile.TemporaryDirectory() as tmp:
+        wiki = Path(tmp) / "wiki"
+        # 模拟上游 stage_files 的产出：staging/ 下已有一份待归档文档
+        (wiki / "staging").mkdir(parents=True, exist_ok=True)
+        (wiki / "staging" / "rag_note.md").write_text(
+            "# RAG\n检索增强生成的核心思想是把检索结果拼进 prompt。",
+            encoding="utf-8",
+        )
+
+        page = ("---\ntitle: RAG\ncategory: AI\ndescription: 检索增强生成\n"
+                "entities: [RAG]\n---\n## 知识内容\n检索增强生成")
+        fake = FakeLLM([
+            tool_resp(tc("list_files", subdir="staging")),
+            tool_resp(tc("read_source", path="staging/rag_note.md")),
+            tool_resp(tc("write_file", path="AI/rag.md", content=page)),
+            text_resp("完成：从 staging 读入并归档。"),
+        ])
+        patch_llm(fake)
+
+        events = await collect(
+            WikiAgent(config=None),
+            task="请把 staging/ 下的 rag_note.md 归档进 wiki。",
+            wiki_root=str(wiki),
+        )
+        result = next((e.content for e in events if e.type == "result"), None)
+
+        check(result == "完成：从 staging 读入并归档。", f"自然停止：{result!r}")
+        check((wiki / "AI" / "rag.md").is_file(), "write_file 真实落盘")
+        # read_source 调用发生在第 2 轮（list_files 后），其 tool 结果出现在第 3 轮 messages
+        tool_msgs_turn3 = [m for m in fake.turns[2] if m.role == "tool"]
+        check(any("检索增强生成的核心思想" in m.content for m in tool_msgs_turn3),
+              "read_source 把 staging/ 原文回填进消息历史")
+
+
+async def scenario_read_source_rejects(check) -> None:
+    print("\n[场景6] read_source 边界：非 staging/ 路径 / 不存在 / 越界 → observation 报错，循环不挂")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        wiki = tmp_dir / "wiki"
+        # wiki 外放一份「邻居」，验证沙箱拦截
+        (tmp_dir / "outside.md").write_text("外部文件", encoding="utf-8")
+
+        fake = FakeLLM([
+            tool_resp(tc("read_source", path="AI/transformer.md")),          # 非 staging/ 前缀
+            tool_resp(tc("read_source", path="staging/nope.md")),            # staging/ 内不存在
+            tool_resp(tc("read_source", path="staging/../../outside.md")),   # 形式合规但 resolve 后越界（沙箱兜底）
+            text_resp("放弃了，结束。"),
+        ])
+        patch_llm(fake)
+
+        events = await collect(WikiAgent(config=None), task="读取并归档。", wiki_root=str(wiki))
+        leaf_errs = [
+            e.content for e in events
+            if e.type == "log" and e.metadata.get("trace") == "leaf" and e.content.startswith("✗")
+        ]
+        check(any("只允许读 staging/" in c for c in leaf_errs),
+              f"非 staging/ 路径被拒：{leaf_errs}")
+        check(any("文件不存在" in c for c in leaf_errs),
+              f"staging 内不存在被报回：{leaf_errs}")
+        check(any("沙箱外" in c for c in leaf_errs),
+              f"路径穿越被沙箱兜底：{leaf_errs}")
+        result = next((e.content for e in events if e.type == "result"), None)
+        check(result == "放弃了，结束。", f"工具报错不打断循环：{result!r}")
 
 
 async def scenario_live(check) -> None:
@@ -193,7 +247,11 @@ async def scenario_live(check) -> None:
         wiki = Path(tmp) / "wiki"
 
         agent = WikiAgent(config=Config.from_env())
-        events = await collect(agent, files=[str(src)], wiki_root=str(wiki))
+        events = await collect(
+            agent,
+            task=f"请把 {src} 这份文档归档进 wiki。",
+            wiki_root=str(wiki),
+        )
         for e in events:
             if e.type in ("log", "result"):
                 tag = "结果" if e.type == "result" else "日志"
@@ -220,7 +278,8 @@ async def main() -> int:
     await scenario_natural(check)
     await scenario_nudge_and_maxsteps(check)
     await scenario_index_blocked(check)
-    await scenario_no_input(check)
+    await scenario_read_source(check)
+    await scenario_read_source_rejects(check)
     if live:
         await scenario_live(check)
     else:
