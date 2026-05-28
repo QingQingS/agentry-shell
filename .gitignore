@@ -17,3 +17,4 @@ run.sh
 
 # macOS
 .DS_Store
+.claude/
