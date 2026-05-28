@@ -1,15 +1,18 @@
 """
-v2 Step 5 验证脚本 —— ResearchAgent 作为 spoke（离线，无网络）。
+v2 Step 5 + Step 5.5 验证：ResearchAgent spoke 契约 + 内部 ReAct 循环。
 
-用 FakeLLM + FakeRetriever 走完 survey 的「拆问 → 多源检索 → 总结 → 报告」全流程，
-断言 dispatch observation 同时含：完整报告原文 + status + 冒头段 summary。
+不发网络请求：FakeLLM 按预设 trajectory（每条决定 content + tool_calls）+ FakeRetriever，
+驱动 ResearchAgent 内部 ReAct 循环走完整路径。
 
-覆盖：
-  1. 正常 survey 经路 → status=ok；summary=报告冒头段；observation 含完整报告原文。
-  2. 全部子问题空检索 → status=degenerate；summary=「（未检索到相关结果）」。
-  3. 入参兼容：context（新）与 background_context（旧 v1）都注入 prompt 作背景。
-
-不覆盖（步5 范围外）：focused 经路（intent 退役后 dead code，步5.5 删）。
+覆盖（按对外契约组织——内部 ReAct 化对外不可见）：
+  1. case_broad_survey：LLM 调 do_broad_survey 一次后写 final → status=ok +
+     summary=冒头段 + dispatch observation 含完整 final 报告。
+  2. case_atomic_search：LLM 自决多次 search_papers 后写 final（步5.5 新能力，
+     不再走复合工具的固定流水线）。
+  3. case_degenerate：LLM 调 search_papers 但检索全空 → status=degenerate +
+     标准 summary。
+  4. case_context_kwarg：context（新）/ background_context（旧 v1）kwarg 都触发
+     背景注入 log（过渡期兼容）。
 """
 
 import asyncio
@@ -23,61 +26,67 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import agents.research_agent as research_module  # noqa: E402
 from agents.research_agent import ResearchAgent  # noqa: E402
 from core.dispatch import DispatchAgentTool  # noqa: E402
-from core.llm.base import BaseLLM, LLMResponse, TokenUsage  # noqa: E402
+from core.llm.base import BaseLLM, LLMResponse, ToolCall, TokenUsage  # noqa: E402
 from core.registry import AgentRegistry, AgentSpec  # noqa: E402
 from core.retrievers.base import BaseRetriever, SearchResult  # noqa: E402
 
 
 class FakeLLM(BaseLLM):
-    """按响应队列顺序返回；chat_stream 走 BaseLLM 默认实现（单块输出）。"""
+    """按预设 trajectory 返回 LLMResponse。
+
+    trajectory[i] = {"content": str, "tool_calls": List[ToolCall]?}
+    超过末尾后重复最后一项（防止下标越界，仍能让循环自然停止）。
+    """
 
     provider_name = "fake"
 
-    def __init__(self, responses: List[str], model: str = "fake-model"):
+    def __init__(self, trajectory: List[dict], model: str = "fake-model"):
         super().__init__(model=model)
-        self._responses = list(responses)
+        self._traj = list(trajectory)
         self._idx = 0
 
     async def chat(self, messages, **kwargs):
-        i = min(self._idx, len(self._responses) - 1)
-        content = self._responses[i]
+        i = min(self._idx, len(self._traj) - 1) if self._traj else 0
+        item = self._traj[i] if self._traj else {"content": ""}
         self._idx += 1
+        content = item.get("content", "")
+        tool_calls = item.get("tool_calls", [])
         usage = TokenUsage(input_tokens=5, output_tokens=10)
         await self._record_usage(usage)
-        return LLMResponse(content=content, usage=usage, model=self.model, provider=self.provider_name)
+        return LLMResponse(
+            content=content,
+            usage=usage,
+            model=self.model,
+            provider=self.provider_name,
+            tool_calls=tool_calls,
+            stop_reason="tool_calls" if tool_calls else "stop",
+        )
 
 
 class FakeRetriever(BaseRetriever):
-    source_name = "fake"
-
-    def __init__(self, results: List[SearchResult]):
+    def __init__(self, results: List[SearchResult], source_name: str = "arxiv"):
         self._results = list(results)
+        self.source_name = source_name
 
     async def search(self, query: str, max_results: int = 5) -> List[SearchResult]:
         return list(self._results[:max_results])
 
 
-SAMPLE_SUB_QUESTIONS = ["q1 about X", "q2 about Y", "q3 about Z"]
-
-# fake smart 一次性输出整段；冒头段不带 markdown 标题，正好覆盖"无标题"分支
-SAMPLE_REPORT = (
-    "这是开头总览：本次调研聚焦三个子方向，发现主流趋势是 X。\n"
+SAMPLE_FINAL = (
+    "这是开头总览：基于检索到的资料，主流方向是 X。\n"
     "\n"
     "## 分点综合\n"
-    "1. 子问题 A：…\n"
-    "2. 子问题 B：…\n"
-    "3. 子问题 C：…\n"
+    "1. 发现 A：…\n"
+    "2. 发现 B：…\n"
     "\n"
     "## 结论\n"
     "综合来看，主流方向是 X。"
 )
 
 
-def _install_fakes(fast_responses, smart_responses, results):
-    """patch get_llm + ResearchAgent._retrievers_for_mode；返回 restore 函数。"""
-    fast = FakeLLM(fast_responses)
-    smart = FakeLLM(smart_responses)
-
+def _install_fakes(fast_traj, smart_traj, results, source_names=("arxiv",)):
+    fast = FakeLLM(fast_traj)
+    smart = FakeLLM(smart_traj)
     original_get_llm = research_module.get_llm
 
     def fake_get_llm(tier=None, config=None):
@@ -85,12 +94,14 @@ def _install_fakes(fast_responses, smart_responses, results):
 
     research_module.get_llm = fake_get_llm
 
-    original_retrievers_method = ResearchAgent._retrievers_for_mode
-    ResearchAgent._retrievers_for_mode = lambda self, mode: [FakeRetriever(results)]
+    original_make = ResearchAgent._make_retrievers
+    ResearchAgent._make_retrievers = lambda self: [
+        FakeRetriever(results, source_name=name) for name in source_names
+    ]
 
     def restore():
         research_module.get_llm = original_get_llm
-        ResearchAgent._retrievers_for_mode = original_retrievers_method
+        ResearchAgent._make_retrievers = original_make
 
     return restore
 
@@ -98,10 +109,7 @@ def _install_fakes(fast_responses, smart_responses, results):
 def _researcher_registry() -> AgentRegistry:
     return AgentRegistry([
         AgentSpec(
-            name="researcher",
-            description="d",
-            input_contract="i",
-            output_contract="o",
+            name="researcher", description="d", input_contract="i", output_contract="o",
             factory=lambda config=None, websocket=None: ResearchAgent(
                 config=config, websocket=websocket
             ),
@@ -109,58 +117,105 @@ def _researcher_registry() -> AgentRegistry:
     ])
 
 
-async def case_ok():
-    """正常 survey：3 个子问题各检索到 2 条 → 总结 → 出报告 → status=ok。"""
+async def case_broad_survey():
+    """LLM 第 1 步调 do_broad_survey → 第 2 步写 final markdown。
+    smart 总共被调 3 次（顶层 step1 tool_call、tool 内部综合、顶层 step2 final）；
+    fast 被调 4 次（拆问 1 + 3 个子问题摘要）。
+    """
     results = [
-        SearchResult(title=f"Paper {i}", url=f"http://x/{i}", snippet="abs", source="fake")
+        SearchResult(title=f"Paper {i}", url=f"http://x/{i}", snippet="abs", source="arxiv")
         for i in range(2)
     ]
-    fast = [json.dumps(SAMPLE_SUB_QUESTIONS)] + ["子问题摘要"] * 3
-    restore = _install_fakes(fast, [SAMPLE_REPORT], results)
+    smart_traj = [
+        {"tool_calls": [ToolCall(
+            id="c1", name="do_broad_survey",
+            arguments={"topic": "RL 最新进展", "background": ""},
+        )]},
+        {"content": "do_broad_survey 内部综合的报告 markdown"},  # 工具内部 smart.chat
+        {"content": SAMPLE_FINAL},                                # 顶层 final
+    ]
+    fast_traj = [
+        {"content": json.dumps(["q1 about X", "q2 about Y", "q3 about Z"])},
+        {"content": "子问题 1 摘要"},
+        {"content": "子问题 2 摘要"},
+        {"content": "子问题 3 摘要"},
+    ]
+    restore = _install_fakes(fast_traj, smart_traj, results)
     try:
         obs = await DispatchAgentTool(_researcher_registry()).execute(
-            agent="researcher", prompt="调研 RL 最新进展", context="聚焦 model-based"
+            agent="researcher", prompt="调研 RL 最新进展", context=""
         )
     finally:
         restore()
 
     assert "[researcher] status=ok" in obs, obs
     head = obs.split("---", 1)[0]
-    assert "summary: 这是开头总览" in head, f"summary 应为报告冒头段：\n{head}"
+    assert "summary: 这是开头总览" in head, f"summary 应取自 final 冒头段：\n{head}"
     assert "分点综合" not in head, "summary 不该越界到下一段"
     assert "\n---\nreport:\n" in obs, "observation 应含 report 段"
     body = obs.split("\nreport:\n", 1)[1]
-    assert body.strip() == SAMPLE_REPORT.strip(), "report 段应是完整报告原文"
-    print("  case_ok OK")
+    assert body.strip() == SAMPLE_FINAL.strip(), "report 段应是 final 报告原文"
+    print("  case_broad_survey OK")
+
+
+async def case_atomic_search():
+    """步5.5 核心新能力：LLM 不走复合工具，自决两次原子 search_papers 后综合。"""
+    results = [SearchResult(title="P A", url="http://a", snippet="abs", source="arxiv")]
+    smart_traj = [
+        {"tool_calls": [ToolCall(id="c1", name="search_papers",
+                                 arguments={"query": "topic A"})]},
+        {"tool_calls": [ToolCall(id="c2", name="search_papers",
+                                 arguments={"query": "topic B"})]},
+        {"content": SAMPLE_FINAL},
+    ]
+    fast_traj = []  # 不走 do_broad_survey，fast 不用
+    restore = _install_fakes(fast_traj, smart_traj, results)
+    try:
+        obs = await DispatchAgentTool(_researcher_registry()).execute(
+            agent="researcher", prompt="读一些 RL 论文然后总结"
+        )
+    finally:
+        restore()
+
+    assert "[researcher] status=ok" in obs, obs
+    assert "summary: 这是开头总览" in obs.split("---", 1)[0], obs
+    body = obs.split("\nreport:\n", 1)[1]
+    assert body.strip() == SAMPLE_FINAL.strip()
+    print("  case_atomic_search OK")
 
 
 async def case_degenerate():
-    """所有子问题都空检索 → status=degenerate + 标准 summary。"""
-    fast = [json.dumps(SAMPLE_SUB_QUESTIONS)]  # 空检索路径下 summarize 不再调用
-    restore = _install_fakes(fast, ["（基于空检索的占位报告）"], results=[])
+    """LLM 调 search_papers 但检索全空 → 工具 obs '(未检索到相关论文)' →
+    循环代码侧统计 retrieval_hits=0 → status=degenerate。
+    """
+    smart_traj = [
+        {"tool_calls": [ToolCall(id="c1", name="search_papers",
+                                 arguments={"query": "obscure topic"})]},
+        {"content": "未找到相关资料，无法生成完整报告。"},
+    ]
+    restore = _install_fakes([], smart_traj, results=[])
     try:
         obs = await DispatchAgentTool(_researcher_registry()).execute(
-            agent="researcher", prompt="冷门话题", context=""
+            agent="researcher", prompt="冷门主题"
         )
     finally:
         restore()
     assert "[researcher] status=degenerate" in obs, obs
     assert "summary: （未检索到相关结果）" in obs, obs
-    # degenerate 也带 report（让 hub 自己决定弃用——决策 10.2：不在 dispatch 层挑挑拣拣）
-    assert "\n---\nreport:\n" in obs, "degenerate 也应带回 report 段"
+    # degenerate 也带 report 段（hub 自决弃用——dispatch 不挑挑拣拣）
+    assert "\n---\nreport:\n" in obs
     print("  case_degenerate OK")
 
 
 async def case_context_kwarg():
-    """新 context 与旧 background_context kwarg 都触发"携带上轮报告"日志。"""
-    results = [SearchResult(title="P", url="u", snippet="s", source="fake")]
+    """新 context 与旧 v1 background_context kwarg 都触发"携带上轮报告"log。"""
+    results = [SearchResult(title="P", url="u", snippet="s", source="arxiv")]
+    smart_traj = [{"content": "（直接答复，不调工具）"}]
     for label, kwargs in [
         ("context (new)", {"context": "上一轮：xxx"}),
         ("background_context (legacy)", {"background_context": "上一轮：xxx"}),
     ]:
-        restore = _install_fakes(
-            [json.dumps(SAMPLE_SUB_QUESTIONS), "s", "s", "s"], [SAMPLE_REPORT], results
-        )
+        restore = _install_fakes([], smart_traj, results)
         logs = []
         try:
             agent = ResearchAgent()
@@ -176,7 +231,8 @@ async def case_context_kwarg():
 
 
 async def main() -> None:
-    await case_ok()
+    await case_broad_survey()
+    await case_atomic_search()
     await case_degenerate()
     await case_context_kwarg()
     print("OK")

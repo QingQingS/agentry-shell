@@ -1,58 +1,184 @@
 """
-ResearchAgent —— 研究型 Agent（多 mode 编排）。
+ResearchAgent —— 研究型 spoke：内部 ReAct 循环，LLM 自决检索 / 抓单页 / 广度调研。
 
-mode 由调用层（OrchestratorAgent）下达，决定检索机制与输出形状；
-mode 枚举 ResearchMode 在此定义，作为 intent 层与本 Agent 的共享契约。
+设计（步5.5 后）：
+  - 对外契约（步5 锁定）不变：入参 (prompt, context)；出 result.content（完整 markdown 报告）
+    + metadata{status, summary}。
+  - 内部 ReAct 循环：smart LLM 驱动，工具表见 agents/research_tools.py
+    （search_papers / search_web / fetch_url / do_broad_survey）。
+  - 不再有 mode/route 分发——「调研最新进展」/「读这篇 paper」/「找开源仓库」
+    都由 LLM 看 prompt 自决用哪个工具。导师/学生类比。
+  - status 三态：循环代码侧统计——所有工具调用 observation 都是「(...)」或「Error:」开头时
+    标 degenerate；否则 ok。summary 取最终答复 markdown 的冒头段（_first_paragraph）。
+  - 自然停止 = LLM 不发 tool_call；触顶 MAX_STEPS 时把当时已有 content 兜成结果。
 
-  survey       广度调研（默认，现行为）：
-                 主问题 → [fast] 拆英文子问题 → 多检索源并发检索/去重
-                       → [fast] 逐子问题总结 → [smart] 汇总结构化报告（流式）
-  paper_lookup 单篇/单一目标（ArXiv）：单次检索 → [smart] 针对性综述
-  code_search  找开源实现（Tavily Web）：单次检索 → [smart] 列出仓库/实现
-
-background_context（可选 kwarg）：上一轮报告，注入提示词作背景，子问题/报告聚焦
-未覆盖角度、不重复已有结论。
-
-检索源：survey 用 config.retriever（逗号分隔多源并发）；paper_lookup 固定 ArXiv；
-code_search 固定 Tavily。
+回环兜底（复用 WikiAgent 风格）：
+  - 错误转 observation（ToolRegistry.execute 永不向循环抛）。
+  - 同一 (name, args) 重复 ≥ DUP_THRESHOLD 次时注入一次 nudge。
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
-from enum import Enum
-from typing import AsyncIterator, List, Tuple
+import time
+from datetime import date
+from typing import AsyncIterator, List
 
+from agents.research_tools import build_research_registry
 from core.agent_interface import AgentEvent, AgentInterface
-from core.llm import ChatMessage, LLMResponse, get_llm
-from core.retrievers import ArxivRetriever, BaseRetriever, SearchResult, TavilyRetriever
+from core.llm import ChatMessage, get_llm
+from core.retrievers import ArxivRetriever, BaseRetriever, TavilyRetriever
 
+MAX_STEPS = 12          # 单次研究的 LLM 调用上限
+DUP_THRESHOLD = 3       # 同一 (tool, args) 重复多少次触发 nudge
 
-class ResearchMode(str, Enum):
-    SURVEY = "survey"
-    PAPER_LOOKUP = "paper_lookup"
-    CODE_SEARCH = "code_search"
+NUDGE_TEXT = (
+    "提醒：你已多次执行同一个工具调用并得到相同结果，似乎卡住了。"
+    "请改变策略——换工具/换参数，或者如果信息已够，直接用 markdown 写出最终报告（不要再调用工具）。"
+)
+
+SYSTEM_PROMPT_TEMPLATE = """你是研究助理。手头有这些工具可用：
+
+- search_papers(query, max_results): 检索 ArXiv 论文，query 用英文效果更好。返回标题/作者/时间/摘要/链接。
+- search_web(query, max_results): 检索网页（开源仓库、博客、代码示例等）。返回标题/链接/摘要。
+- fetch_url(url, max_chars): 抓取指定 URL 的文本内容（HTML 去 tag 后返回）。用于读特定论文 / 看某个 README。
+- do_broad_survey(topic, background): 对一个主题做广度调研（拆问 → 多源并发检索 → 综合），返回完整 markdown 报告。
+  适合「调研 X 最新进展」这类宽问题——一次调用拿到结构化产出。
+
+工作流程：
+1. 看用户的研究任务，自主决定调用哪些工具。
+   - 宽调研 → 通常一次 do_broad_survey 就够（也可以再补充 search/fetch 修补具体点）。
+   - 找开源实现 → search_web 优先。
+   - 读特定论文 / 看 README → fetch_url 抓全文。
+   - 自己拆细问题分别查 → 多次 search_papers。
+2. 完成后，直接用 markdown 写出最终研究报告：开头一段总览，分点论述，结论收尾。
+   报告之后不要再调用工具——这是循环结束信号。
+
+今天的日期：{today}
+"""
 
 
 class ResearchAgent(AgentInterface):
     name = "ResearchAgent"
-    description = "研究型 Agent：按 mode（survey/paper_lookup/code_search）编排检索与报告。"
+    description = "研究型 spoke：内部 ReAct 循环，自决检索论文/网页/抓单页/广度调研。"
 
-    NUM_SUB_QUESTIONS = 3
-    RESULTS_PER_QUESTION = 4
-    FOCUSED_RESULTS = 6
+    async def run(self, task: str, **kwargs) -> AsyncIterator[AgentEvent]:
+        # 生命周期与异常→error 由 core.runner 统一负责；这里只 yield 领域事件、失败时抛异常。
+        # context 是新接口；旧 v1 OrchestratorAgent 仍传 background_context（cutover 时删）。
+        background = (kwargs.get("context") or kwargs.get("background_context") or "").strip()
 
-    @staticmethod
-    def _normalize_mode(value) -> ResearchMode:
-        try:
-            return ResearchMode(value)
-        except (ValueError, TypeError):
-            return ResearchMode.SURVEY
+        fast = get_llm(tier="fast", config=self.config)
+        smart = get_llm(tier="smart", config=self.config)
+        retrievers = self._make_retrievers()
+        registry = build_research_registry(fast, smart, retrievers)
+        specs = registry.specs()
+
+        yield AgentEvent(
+            type="log",
+            content=(
+                f"smart={smart.model} 驱动循环；fast={fast.model} 备 do_broad_survey；"
+                f"检索源={'+'.join(r.source_name for r in retrievers)}"
+            ),
+            metadata={"smart_model": smart.model, "fast_model": fast.model},
+        )
+        if background:
+            yield AgentEvent(type="log", content="（携带上轮报告作背景）")
+
+        today = date.today().isoformat()
+        user_msg = task if not background else (
+            f"{task}\n\n参考上一轮研究的已有结论（承接但不重复）：\n{background}"
+        )
+        messages: List[ChatMessage] = [
+            ChatMessage(role="system", content=SYSTEM_PROMPT_TEMPLATE.format(today=today)),
+            ChatMessage(role="user", content=user_msg),
+        ]
+
+        call_counts: dict = {}
+        nudged = False
+        retrieval_calls = 0      # 工具调用总数
+        retrieval_hits = 0       # 非空（非 Error/非「(...)」开头）的工具结果数
+        final_content = ""
+        stopped_naturally = False
+
+        for step in range(MAX_STEPS):
+            t0 = time.monotonic()
+            resp = await smart.chat(messages, tools=specs)
+            dt = time.monotonic() - t0
+            messages.append(ChatMessage(
+                role="assistant",
+                content=resp.content,
+                tool_calls=resp.tool_calls,
+                reasoning_content=resp.reasoning_content,
+            ))
+
+            think = (resp.reasoning_content or resp.content or "").strip()
+            if think:
+                yield AgentEvent(type="log", content=think, metadata={"trace": "think"})
+            yield AgentEvent(
+                type="log",
+                content=f"第 {step + 1} 步 · {dt:.1f}s · +{resp.usage.total_tokens} tokens",
+                metadata={"trace": "leaf"},
+            )
+
+            if not resp.tool_calls:
+                final_content = resp.content
+                stopped_naturally = True
+                break
+
+            for call in resp.tool_calls:
+                sig = (call.name, json.dumps(call.arguments, sort_keys=True, ensure_ascii=False))
+                call_counts[sig] = call_counts.get(sig, 0) + 1
+                obs = await registry.execute(call)
+                messages.append(ChatMessage(role="tool", content=obs, tool_call_id=call.id))
+                yield AgentEvent(
+                    type="log",
+                    content=self._describe_action(call.name, call.arguments),
+                    metadata={"trace": "action"},
+                )
+                yield AgentEvent(
+                    type="log",
+                    content=self._summarize_obs(call.name, obs),
+                    metadata={"trace": "leaf"},
+                )
+                retrieval_calls += 1
+                if not self._is_empty_obs(obs):
+                    retrieval_hits += 1
+
+            if not nudged and any(c >= DUP_THRESHOLD for c in call_counts.values()):
+                messages.append(ChatMessage(role="user", content=NUDGE_TEXT))
+                yield AgentEvent(type="log", content="检测到重复调用，已注入提醒（nudge）")
+                nudged = True
+
+        if not stopped_naturally:
+            yield AgentEvent(type="log", content=f"达到步数上限（{MAX_STEPS}），提前结束。")
+            if not final_content:
+                final_content = "（因达步数上限未能写出完整报告。）"
+
+        total = fast.cumulative_usage + smart.cumulative_usage
+        yield AgentEvent(
+            type="tokens",
+            content=f"累计 input={total.input_tokens} output={total.output_tokens} total={total.total_tokens}",
+            metadata={**total.to_dict(), "scope": "cumulative"},
+        )
+
+        # status：调过工具且全部空 → degenerate；否则 ok。无工具调用（纯对话答复）也算 ok。
+        if retrieval_calls > 0 and retrieval_hits == 0:
+            status, summary = "degenerate", "（未检索到相关结果）"
+        else:
+            status, summary = "ok", self._first_paragraph(final_content)
+        yield AgentEvent(
+            type="result",
+            content=final_content,
+            metadata={"status": status, "summary": summary},
+        )
+
+    # ---- 辅助 ----
 
     def _make_retrievers(self) -> List[BaseRetriever]:
-        """解析 config.retriever（逗号分隔），返回检索器列表（survey 用）。"""
+        """解析 config.retriever（逗号分隔），返回 retriever 列表。
+
+        测试通过 monkey-patch 这个方法注入 fake retrievers。"""
         names = [
             n.strip().lower()
             for n in getattr(self.config, "retriever", "arxiv").split(",")
@@ -68,273 +194,35 @@ class ResearchAgent(AgentInterface):
                 retrievers.append(ArxivRetriever())
         return retrievers or [ArxivRetriever()]
 
-    def _retrievers_for_mode(self, mode: ResearchMode) -> List[BaseRetriever]:
-        if mode == ResearchMode.PAPER_LOOKUP:
-            return [ArxivRetriever()]
-        if mode == ResearchMode.CODE_SEARCH:
-            return [TavilyRetriever(api_key=getattr(self.config, "tavily_api_key", None))]
-        return self._make_retrievers()
+    @staticmethod
+    def _is_empty_obs(obs: str) -> bool:
+        """工具观察是否「无收获」：以 `(` 开头（约定的占位）或 `Error:` 开头。"""
+        s = obs.lstrip()
+        return s.startswith("(") or s.startswith("Error:")
 
-    def _merge_results(self, batches: List[List[SearchResult]]) -> List[SearchResult]:
-        """多源结果合并，按 URL 去重，保持各源交叉排列以均衡来源。"""
-        seen: set = set()
-        merged: List[SearchResult] = []
-        for items in zip(*[b for b in batches if b]):   # 交叉：arxiv[0], tavily[0], arxiv[1]...
-            for r in items:
-                if r.url not in seen:
-                    seen.add(r.url)
-                    merged.append(r)
-        for batch in batches:
-            for r in batch:
-                if r.url not in seen:
-                    seen.add(r.url)
-                    merged.append(r)
-        return merged
+    @staticmethod
+    def _describe_action(name: str, args: dict) -> str:
+        if name in ("search_papers", "search_web"):
+            return f"{name}({args.get('query')!r})"
+        if name == "fetch_url":
+            return f"fetch_url({args.get('url')})"
+        if name == "do_broad_survey":
+            return f"do_broad_survey({args.get('topic')!r})"
+        return f"{name}({json.dumps(args, ensure_ascii=False)})"
 
-    async def run(self, task: str, **kwargs) -> AsyncIterator[AgentEvent]:
-        # 生命周期与异常→error 事件由 core.runner 统一负责；这里只 yield 领域事件、失败时抛异常。
-        mode = self._normalize_mode(kwargs.get("mode"))
-        # 新接口走 context；旧 v1 OrchestratorAgent 仍传 background_context（cutover 时删）。
-        background = (kwargs.get("context") or kwargs.get("background_context") or "").strip()
-
-        fast = get_llm(tier="fast", config=self.config)
-        smart = get_llm(tier="smart", config=self.config)
-        retrievers = self._retrievers_for_mode(mode)
-        source_names = "+".join(r.source_name for r in retrievers)
-
-        yield AgentEvent(
-            type="log",
-            content=f"mode={mode.value}，fast={fast.model}/smart={smart.model}，检索源={source_names}",
-            metadata={"mode": mode.value, "fast_model": fast.model, "smart_model": smart.model, "retriever": source_names},
-        )
-        if background:
-            yield AgentEvent(type="log", content="（携带上轮报告作背景）")
-
-        if mode == ResearchMode.SURVEY:
-            async for ev in self._run_survey(task, background, fast, smart, retrievers):
-                yield ev
-        else:
-            async for ev in self._run_focused(task, background, mode, smart, retrievers[0]):
-                yield ev
-
-    # ── survey：广度调研（现行为 + 背景注入）────────────────────────────────
-
-    async def _run_survey(
-        self, task: str, background: str, fast, smart, retrievers: List[BaseRetriever]
-    ) -> AsyncIterator[AgentEvent]:
-        # 1) 拆解子问题
-        yield AgentEvent(type="log", content=f"拆解研究问题：{task}")
-        resp = await fast.chat(self._decompose_messages(task, background))
-        yield self._tokens_event(resp)
-        sub_questions = self._parse_subquestions(resp.content) or [task]
-        yield AgentEvent(
-            type="log",
-            content=f"得到 {len(sub_questions)} 个子问题：" + " | ".join(sub_questions),
-            metadata={"sub_questions": sub_questions},
-        )
-
-        # 2) 逐子问题：多源并发检索 + 合并去重 + 总结
-        summaries: List[Tuple[str, str]] = []
-        for i, sq in enumerate(sub_questions, 1):
-            yield AgentEvent(type="log", content=f"[{i}/{len(sub_questions)}] 检索：{sq}")
-
-            raw = await asyncio.gather(
-                *[r.search(sq, max_results=self.RESULTS_PER_QUESTION) for r in retrievers],
-                return_exceptions=True,
-            )
-            batches: List[List[SearchResult]] = []
-            for retriever, outcome in zip(retrievers, raw):
-                if isinstance(outcome, Exception):
-                    yield AgentEvent(
-                        type="log",
-                        content=f"  [{retriever.source_name}] 检索失败，跳过：{outcome}",
-                    )
-                    batches.append([])
-                else:
-                    batches.append(outcome)
-                    if len(retrievers) > 1:
-                        yield AgentEvent(type="log", content=f"  [{retriever.source_name}] {len(outcome)} 条")
-
-            results = self._merge_results(batches)
-            total_label = f"合计 {len(results)} 条" + ("（去重后）" if len(retrievers) > 1 else "")
-            yield AgentEvent(type="log", content=f"  {total_label}")
-
-            if not results:
-                summaries.append((sq, "（未检索到相关论文）"))
-                continue
-
-            resp = await fast.chat(self._summarize_messages(sq, results))
-            yield self._tokens_event(resp)
-            summaries.append((sq, resp.content))
-            yield AgentEvent(type="log", content=f"  已总结子问题 {i}")
-
-        # 3) 汇总最终报告（流式推送）
-        yield AgentEvent(type="log", content="汇总最终报告…")
-        report_msgs = self._report_messages(task, summaries, background)
-        full_report = ""
-        async for chunk in smart.chat_stream(report_msgs):
-            full_report += chunk
-            yield AgentEvent(type="stream", content=chunk)
-
-        async for ev in self._final_token_events(fast, smart):
-            yield ev
-
-        # status 三态：所有子问题都空检索 → degenerate；否则 ok。summary 取报告冒头段（免 LLM 自摘要）。
-        degenerate = bool(summaries) and all(s == "（未检索到相关论文）" for _, s in summaries)
-        if degenerate:
-            status, summary = "degenerate", "（未检索到相关结果）"
-        else:
-            status, summary = "ok", self._first_paragraph(full_report)
-        yield AgentEvent(
-            type="result",
-            content=full_report,
-            metadata={"status": status, "summary": summary},
-        )
-
-    # ── paper_lookup / code_search：单源单查询 + 针对性报告 ──────────────────
-
-    async def _run_focused(
-        self, task: str, background: str, mode: ResearchMode, smart, retriever: BaseRetriever
-    ) -> AsyncIterator[AgentEvent]:
-        query = self._focused_query(task, mode)
-        yield AgentEvent(type="log", content=f"[{mode.value}] 检索：{query}")
-        results = await retriever.search(query, max_results=self.FOCUSED_RESULTS)
-        yield AgentEvent(
-            type="log",
-            content=f"  [{retriever.source_name}] 得到 {len(results)} 条",
-            metadata={"count": len(results)},
-        )
-        if not results:
-            yield AgentEvent(type="result", content="（未检索到相关结果）")
-            return
-
-        report_msgs = self._focused_report_messages(task, results, background, mode)
-        full_report = ""
-        async for chunk in smart.chat_stream(report_msgs):
-            full_report += chunk
-            yield AgentEvent(type="stream", content=chunk)
-
-        usage = smart.cumulative_usage
-        yield AgentEvent(
-            type="tokens",
-            content=f"input={usage.input_tokens} output={usage.output_tokens} total={usage.total_tokens}",
-            metadata={**usage.to_dict(), "provider": smart.provider_name, "model": smart.model, "scope": "cumulative"},
-        )
-        yield AgentEvent(type="result", content=full_report)
-
-    def _focused_query(self, task: str, mode: ResearchMode) -> str:
-        if mode == ResearchMode.CODE_SEARCH:
-            return f"{task} github open source implementation code"
-        return task
-
-    # ── prompt 构造 ──────────────────────────────────────────────────────
-
-    def _format_results(self, results: List[SearchResult]) -> str:
-        def _fmt(r: SearchResult) -> str:
-            lines = [f"标题: {r.title}"]
-            if r.published:
-                lines.append(f"发表时间: {r.published}")
-            if r.authors:
-                lines.append(f"作者: {', '.join(r.authors)}")
-            lines.append(f"摘要: {r.snippet}")
-            lines.append(f"链接: {r.url}")
-            return "\n".join(lines)
-
-        return "\n\n".join(_fmt(r) for r in results)
-
-    def _decompose_messages(self, task: str, background: str = "") -> List[ChatMessage]:
-        system = (
-            "你是研究助理。把用户的研究主题拆解成具体、可检索的英文子问题"
-            "（ArXiv 论文检索用英文效果更好）。"
-            f"只输出一个 JSON 数组，包含 {self.NUM_SUB_QUESTIONS} 个字符串，不要任何其它文字。"
-            '例如：["sub question 1", "sub question 2", "sub question 3"]'
-        )
-        if background:
-            system += (
-                "\n\n用户已有以下背景研究，请让子问题聚焦于背景未覆盖的新角度：\n" + background
-            )
-        return [
-            ChatMessage(role="system", content=system),
-            ChatMessage(role="user", content=task),
-        ]
-
-    def _summarize_messages(self, sub_question: str, results: List[SearchResult]) -> List[ChatMessage]:
-        return [
-            ChatMessage(
-                role="system",
-                content=(
-                    "你是研究助理。根据提供的资料，用中文简洁总结针对该子问题的发现（2-4 句），"
-                    "并引用相关来源（使用原标题，不要翻译）。"
-                    "如有发表时间和作者信息，请在引用时一并标注。"
-                    "不要编造资料之外的内容。"
-                ),
-            ),
-            ChatMessage(role="user", content=f"子问题：{sub_question}\n\n检索到的资料：\n{self._format_results(results)}"),
-        ]
-
-    def _report_messages(self, task: str, summaries: List[Tuple[str, str]], background: str = "") -> List[ChatMessage]:
-        body = "\n\n".join(
-            f"## 子问题 {i}：{sq}\n{summ}" for i, (sq, summ) in enumerate(summaries, 1)
-        )
-        system = (
-            "你是研究分析师。基于各子问题的发现，写一份结构化中文研究简报："
-            "开头一段总览，然后分点综合各发现，最后给出结论。使用 Markdown 格式。"
-        )
-        if background:
-            system += "\n\n参考以下上一轮研究的已有结论，承接但不要重复：\n" + background
-        return [
-            ChatMessage(role="system", content=system),
-            ChatMessage(role="user", content=f"研究主题：{task}\n\n各子问题发现：\n{body}"),
-        ]
-
-    def _focused_report_messages(
-        self, task: str, results: List[SearchResult], background: str, mode: ResearchMode
-    ) -> List[ChatMessage]:
-        if mode == ResearchMode.CODE_SEARCH:
-            system = (
-                "你是研究助理。基于检索资料，用中文列出与目标相关的开源实现 / GitHub 仓库，"
-                "每项给出：名称、链接、一句话简介。按相关度排序。不要编造资料之外的内容。"
-                "使用 Markdown 列表格式。"
-            )
-        else:  # PAPER_LOOKUP
-            system = (
-                "你是研究助理。基于检索资料，用中文针对该目标做一份简明综述："
-                "核心贡献、方法要点、关键结论，并引用来源（原标题、作者、发表时间）。"
-                "不要编造资料之外的内容。使用 Markdown 格式。"
-            )
-        if background:
-            system += "\n\n参考以下上一轮研究的已有结论，承接但不要重复：\n" + background
-        return [
-            ChatMessage(role="system", content=system),
-            ChatMessage(role="user", content=f"目标：{task}\n\n检索到的资料：\n{self._format_results(results)}"),
-        ]
-
-    # ── 工具方法 ─────────────────────────────────────────────────────────
-
-    async def _final_token_events(self, fast, smart) -> AsyncIterator[AgentEvent]:
-        smart_usage = smart.cumulative_usage
-        yield AgentEvent(
-            type="tokens",
-            content=f"input={smart_usage.input_tokens} output={smart_usage.output_tokens} total={smart_usage.total_tokens}",
-            metadata={**smart_usage.to_dict(), "provider": smart.provider_name, "model": smart.model},
-        )
-        total = fast.cumulative_usage + smart.cumulative_usage
-        yield AgentEvent(
-            type="tokens",
-            content=f"累计 input={total.input_tokens} output={total.output_tokens} total={total.total_tokens}",
-            metadata={**total.to_dict(), "scope": "cumulative"},
-        )
-
-    def _tokens_event(self, resp: LLMResponse) -> AgentEvent:
-        return AgentEvent(
-            type="tokens",
-            content=(
-                f"input={resp.usage.input_tokens}  "
-                f"output={resp.usage.output_tokens}  "
-                f"total={resp.usage.total_tokens}"
-            ),
-            metadata={**resp.usage.to_dict(), "provider": resp.provider, "model": resp.model},
-        )
+    @staticmethod
+    def _summarize_obs(name: str, obs: str) -> str:
+        if obs.startswith("Error:"):
+            return f"✗ {obs}"
+        if obs.startswith("("):
+            return obs
+        if name == "do_broad_survey":
+            return f"得到 broad_survey 报告 / {len(obs)} 字"
+        if name == "fetch_url":
+            return f"抓到 {len(obs)} 字"
+        # search_papers / search_web：用 `\n\n` 计条数
+        n = obs.count("\n\n") + 1
+        return f"得到 {n} 条结果 / {len(obs)} 字"
 
     @staticmethod
     def _first_paragraph(text: str) -> str:
@@ -354,22 +242,3 @@ class ResearchAgent(AgentInterface):
         if para:
             return " ".join(para)
         return re.sub(r"\s+", " ", text).strip()[:200]
-
-    def _parse_subquestions(self, text: str) -> List[str]:
-        """先尝试解析 JSON 数组，失败则回退到按行切分（去掉项目符号/编号）。"""
-        m = re.search(r"\[.*\]", text, re.DOTALL)
-        if m:
-            try:
-                arr = json.loads(m.group(0))
-                qs = [str(x).strip() for x in arr if str(x).strip()]
-                if qs:
-                    return qs[: self.NUM_SUB_QUESTIONS]
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        lines = []
-        for ln in text.splitlines():
-            ln = re.sub(r"^\s*[-*\d.)\]]+\s*", "", ln).strip().strip('"').strip()
-            if ln:
-                lines.append(ln)
-        return lines[: self.NUM_SUB_QUESTIONS]

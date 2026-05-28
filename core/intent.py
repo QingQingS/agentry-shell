@@ -11,7 +11,9 @@
     - 一次 fast LLM 调用完成全部字段，严格 JSON 输出
     - 无上下文（首轮）跳过 LLM，直接返回 research/survey
     - 解析失败降级为 research/survey（最安全的默认）
-    - ResearchMode 是跨层契约，定义在 agents.research_agent（agent 拥有），此处 import
+
+注：步5.5 后 ResearchAgent 内部 ReAct 化，mode 概念在 spoke 侧已消失（kwarg 仍被
+接收但被忽略）。ResearchMode 枚举退化为本模块私有，v1 cutover 时随 intent.py 一并删除。
 """
 
 from __future__ import annotations
@@ -19,11 +21,22 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import List, Optional
 
-from agents.research_agent import ResearchMode
 from core.llm import ChatMessage
 from core.session import RecentContext
+
+
+class ResearchMode(str, Enum):
+    """[deprecated] v1 路由 → ResearchAgent 的 mode 契约。
+
+    步5.5 后 ResearchAgent 内部 ReAct 化、mode 不再被读取；此枚举仅 intent.py 自用
+    （仍向旧 OrchestratorAgent 输出 mode 字段以兼容 v1），v1 cutover 时一并删除。
+    """
+    SURVEY = "survey"
+    PAPER_LOOKUP = "paper_lookup"
+    CODE_SEARCH = "code_search"
 
 _ROUTES = {"research", "chat", "wiki"}
 _MODES = {m.value for m in ResearchMode}

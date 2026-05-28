@@ -257,3 +257,32 @@ Task(agent: str, prompt: str, context: str)
 **风险**：内部 ReAct 比固定流水线多 token（带累计上下文+reasoning）。但 WikiAgent 已示范过 −72% 优化路径（[[wiki-index]] 代码侧投影），同套路可类比应用——不重灌过期资料。
 
 > **下次接续**：先完成步5（小、独立闭环、可验证），再单独议步5.5（设计 → 编码）。步6/步7/步8 不动。
+
+### 10.4 步5.5 实施完成（2026-05-28 晚）
+
+提交节点：`<待填>`。`agents/research_tools.py` 新建 + `agents/research_agent.py` 全面重写 +
+`core/intent.py` 内联 ResearchMode（旧 v1 兼容）+ `tests/check_research_spoke.py` 重写为
+ReAct trajectory + `tests/check_agents.py` 清死断言。
+
+**5 拍板点全部按素案实施**：
+- 工具表 4 个：search_papers / search_web / fetch_url / do_broad_survey ✅
+- 工具放 `agents/research_tools.py`（私有，不进 Coordinator 注册表）✅
+- fetch_url 用 stdlib urllib + re 去 tag（asyncio.to_thread 不阻塞，无新依赖）✅
+- do_broad_survey 内部 stream chunks 丢失，token 累计仍保 ✅
+- v1 路径接受行为变化（mode kwarg 被忽略，LLM 自决工具）✅
+
+**实施过程的微调**：
+- ResearchMode 从 research_agent 删后，intent.py 失去 import 源 → 在 intent.py 内联
+  ResearchMode 枚举，标 deprecated（v1 cutover 时随 intent.py 一并删）。
+- `_make_retrievers` 保留（_retrievers_for_mode 删）——测试 mock 点也由它接住。
+- `degenerate` 判定：循环代码侧统计「retrieval_calls > 0 且所有 obs 都以 `(` 或 `Error:`
+  开头」→ degenerate。这对原子工具（"(未检索到相关论文)" 等）和 do_broad_survey 的全空占位
+  ("(未检索到相关资料：...)") 都统一识别。
+
+**步5 对外契约不变得到验证**：步5 测试（FakeLLM trajectory + FakeRetriever）改写后断言
+本身不变（status/summary/observation 含完整报告），只是 mock 点从 _retrievers_for_mode
+换成 _make_retrievers，FakeLLM 从「按消息内容路由」换成「按 trajectory 队列出」。
+
+**下次接续：步 6** WikiAgent 成 spoke（入参 `(prompt, context)`、`_resolve_input_paths`
+用正则抠 `\S+\.md`、收尾 result 带 metadata`{status, summary(touched 页), key_facts}`）。
+步6 比步5.5 小：WikiAgent 已是 ReAct 循环，只需调整入参解析 + result metadata。
