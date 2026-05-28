@@ -221,7 +221,7 @@ Task(agent: str, prompt: str, context: str)
 | 分歧 | 决定 | 理由 |
 |---|---|---|
 | ① `summary` 来源（步5A 不允许 LLM 自摘要） | **取报告冒头一段（overview）** | report prompt 已经写「开头一段总览」，事实上的免费摘要；机械截断（`_snippet` 那样）失语义 |
-| ② status 三态 vs 二态 | **拾起 degenerate**（空检索两条早返回路径标 `degenerate`） | 档案 8.4 明确三态，且空检索经路已经在代码里（research_agent.py:162/196），拾起成本极小 |
+| ② status 三态 vs 二态 | **拾起 degenerate**（survey 末尾聚合检测"所有子问题都空检索"时标 `degenerate`） | 档案 8.4 明确三态；失败标记现成在 research_agent.py:162（per-subquestion `continue`），末尾用 `all(...)` 聚合判定成本极小；focused 经路 196 不动（步5.5 删） |
 | ③ focused 经路（paper_lookup/code_search）的 metadata | **不动，只给 survey 加** | intent 退役后 focused 是 dead code；YAGNI；且步5.5 会把它整个删掉 |
 
 ### 10.2 步5 实际变更点（小，半天活）

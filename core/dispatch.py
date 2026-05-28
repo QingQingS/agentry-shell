@@ -113,13 +113,16 @@ class DispatchAgentTool(Tool):
                 error_text = ev.content
 
         if error_text is not None:
-            return self._format(agent_name, "error", error_text, None, None)
+            return self._format(agent_name, "error", error_text, None, None, report=None)
 
         status = result_meta.get("status", "ok")
         summary = result_meta.get("summary") or self._snippet(result_content)
         artifact = result_meta.get("artifact_path")
         key_facts = result_meta.get("key_facts")
-        return self._format(agent_name, status, summary, artifact, key_facts)
+        return self._format(
+            agent_name, status, summary, artifact, key_facts,
+            report=result_content or None,
+        )
 
     @staticmethod
     def _snippet(text: str) -> str:
@@ -129,10 +132,17 @@ class DispatchAgentTool(Tool):
         return flat[:_SUMMARY_LEN] + ("…" if len(flat) > _SUMMARY_LEN else "")
 
     @staticmethod
-    def _format(agent_name, status, summary, artifact, key_facts) -> str:
+    def _format(agent_name, status, summary, artifact, key_facts, report=None) -> str:
+        """observation 字符串：status/summary 必出；artifact/key_facts/report 有才出。
+
+        report = spoke 最终 result.content 原文（完整 markdown）。2026-05-28 决定
+        改为带回完整成品而非只摘要——hub 在自己 LLM 上下文里使用，不再需要回读文件。
+        """
         lines = [f"[{agent_name}] status={status}", f"summary: {summary}"]
         if artifact:
             lines.append(f"artifact: {artifact}")
         if key_facts:
             lines.append(f"key_facts: {key_facts}")
+        if report:
+            lines.extend(["---", "report:", report])
         return "\n".join(lines)

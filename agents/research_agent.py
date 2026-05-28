@@ -94,7 +94,8 @@ class ResearchAgent(AgentInterface):
     async def run(self, task: str, **kwargs) -> AsyncIterator[AgentEvent]:
         # 生命周期与异常→error 事件由 core.runner 统一负责；这里只 yield 领域事件、失败时抛异常。
         mode = self._normalize_mode(kwargs.get("mode"))
-        background = (kwargs.get("background_context") or "").strip()
+        # 新接口走 context；旧 v1 OrchestratorAgent 仍传 background_context（cutover 时删）。
+        background = (kwargs.get("context") or kwargs.get("background_context") or "").strip()
 
         fast = get_llm(tier="fast", config=self.config)
         smart = get_llm(tier="smart", config=self.config)
@@ -177,7 +178,18 @@ class ResearchAgent(AgentInterface):
 
         async for ev in self._final_token_events(fast, smart):
             yield ev
-        yield AgentEvent(type="result", content=full_report)
+
+        # status 三态：所有子问题都空检索 → degenerate；否则 ok。summary 取报告冒头段（免 LLM 自摘要）。
+        degenerate = bool(summaries) and all(s == "（未检索到相关论文）" for _, s in summaries)
+        if degenerate:
+            status, summary = "degenerate", "（未检索到相关结果）"
+        else:
+            status, summary = "ok", self._first_paragraph(full_report)
+        yield AgentEvent(
+            type="result",
+            content=full_report,
+            metadata={"status": status, "summary": summary},
+        )
 
     # ── paper_lookup / code_search：单源单查询 + 针对性报告 ──────────────────
 
@@ -323,6 +335,25 @@ class ResearchAgent(AgentInterface):
             ),
             metadata={**resp.usage.to_dict(), "provider": resp.provider, "model": resp.model},
         )
+
+    @staticmethod
+    def _first_paragraph(text: str) -> str:
+        """报告冒头一段：跳过空行和 # 标题行，取第一段连续内容；找不到则回退取前 200 字。"""
+        para: List[str] = []
+        for ln in text.strip().splitlines():
+            s = ln.strip()
+            if not s:
+                if para:
+                    break
+                continue
+            if s.startswith("#"):
+                if para:
+                    break
+                continue
+            para.append(s)
+        if para:
+            return " ".join(para)
+        return re.sub(r"\s+", " ", text).strip()[:200]
 
     def _parse_subquestions(self, text: str) -> List[str]:
         """先尝试解析 JSON 数组，失败则回退到按行切分（去掉项目符号/编号）。"""
