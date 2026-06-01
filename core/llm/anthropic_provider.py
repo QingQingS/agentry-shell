@@ -26,7 +26,7 @@ class AnthropicProvider(BaseLLM):
             base_url=self.base_url,
         )
 
-    async def chat(
+    async def _chat_impl(
         self,
         messages: List[ChatMessage],
         *,

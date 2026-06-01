@@ -73,12 +73,22 @@ def _parse_page(root: Path, p: Path) -> PageMeta:
     )
 
 
+STAGING_DIRNAME = "staging"   # 待归档原料区，不属于已策展页面，排除出目录与列举
+
+
 def collect_pages(root: Path) -> List[PageMeta]:
-    """收集 root 下除 index.md 外所有 .md 页面的元数据（路径序，确定性）。"""
+    """收集 root 下已策展 .md 页面的元数据（路径序，确定性）。
+
+    排除 index.md（系统索引自身）与 staging/（待归档原料，尚未策展）——后者若混入
+    目录会变成空描述的垃圾条目，污染 reviewer 第一眼看到的 wiki。
+    """
     root = Path(root)
     pages: List[PageMeta] = []
     for p in sorted(root.rglob("*.md")):
         if p.name == INDEX_FILENAME:
+            continue
+        rel = p.relative_to(root)
+        if rel.parts and rel.parts[0] == STAGING_DIRNAME:
             continue
         try:
             pages.append(_parse_page(root, p))

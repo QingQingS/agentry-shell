@@ -1,6 +1,10 @@
 """
 OrchestratorAgent —— 连续对话编排中枢（阶段三）。
 
+⚠️ DORMANT（v1）：本类是 v1 的固定意图路由中枢，已不在活跃 demo 路径上，默认不再加载
+（AGENT_CLASS 默认指向 v2 CoordinatorAgent）。其 wiki 路由在 wiki staging 化后已失效
+（见 run() 内说明）。保留作历史/对照；当前归档与编排请走 v2 hub-and-spoke。
+
 存在意义：worker（ResearchAgent / ChatAgent）保持无状态，每次 run() 失忆；
 Orchestrator 把「一串无状态 worker 调用」缝成「连贯对话」，是跨轮状态的家。
 
@@ -80,6 +84,13 @@ class OrchestratorAgent(AgentInterface):
             worker: AgentInterface = ResearchAgent(config=self.config, websocket=self.websocket)
             run_iter = worker.run(intent.target, mode=intent.mode, background_context=background)
         elif intent.route == "wiki":
+            # [DORMANT/已弃用] v1 wiki 路由：wiki staging 化后，WikiAgent 只读 wiki/staging/、
+            # 不再消费 files=，这条路径实际读不到用户文件。保留入口但给出明确「已弃用」提示，
+            # 不再静默失败——归档请改用 v2 CoordinatorAgent（stage_files → wiki_curator）。
+            yield AgentEvent(
+                type="log",
+                content="[已弃用] v1 wiki 路由在 staging 化后失效；请改用 v2 CoordinatorAgent（AGENT_CLASS 默认）归档。",
+            )
             # wiki 是持久化知识库，跨 session 共享 → 不传 session 级 wiki_root，用 WikiAgent 默认
             worker = WikiAgent(config=self.config, websocket=self.websocket)
             run_iter = worker.run(task, files=intent.files)

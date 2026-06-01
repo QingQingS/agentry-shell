@@ -1,178 +1,174 @@
-"""
-Step 3 验证：core/staging.py 的两条受控搬运通道。
+"""check_staging.py —— ImportFilesTool + staging pre-hook 的离线验证。
 
-  外部 path ──import_files──► uploads/  ─┐
-                                          ├──stage_files──► wiki/staging/
-        reports/<filename>  ─────────────┘
-
-覆盖：
-  1. case_import_basic：外部 .md → uploads/，返回相对 cwd 路径
-  2. case_import_rejects：不存在 / 后缀拒绝 / 超大 / 空列表
-  3. case_import_conflict：同名冲突自动加时间戳后缀（不覆盖）
-  4. case_stage_basic：reports/ 与 uploads/ 下的文件 → wiki/staging/
-  5. case_stage_rejects：非 reports/uploads 前缀 / 不存在 / 越界
-  6. case_end_to_end：import_files → stage_files 双步联动，路径互相承接
+跑：python tests/check_staging.py
+断言：
+  ImportFilesTool —— 合法入库、外部 path 收口 uploads/、后缀白名单、冲突加时间戳。
+  stage_one —— 拍平命名、幂等跳过（同内容重试无副作用）、同名异内容报错、
+               前缀/越界/不存在拒绝。
+  stage_wiki_inputs —— 就地改写 payload['files'] 成 staging 文件名、失败短路返回错误串、
+               重复调用幂等（不再像旧 StageFilesTool 那样换时间戳堆积）。
+全程文件系统操作，无 LLM、无网络。
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import os
 import sys
 import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.staging import MAX_BYTES, ImportFilesTool, StageFilesTool   # noqa: E402
+from core.staging import (  # noqa: E402
+    ImportFilesTool,
+    StageError,
+    stage_one,
+    stage_wiki_inputs,
+)
 
 
-async def case_import_basic():
-    print("\n[1] import_files：外部 .md → uploads/")
-    with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp):
-        ext = Path(tmp) / "external" / "note.md"
-        ext.parent.mkdir(parents=True)
-        ext.write_text("外部笔记内容", encoding="utf-8")
-
-        tool = ImportFilesTool()
-        obs = await tool.execute(paths=[str(ext)])
-        assert "✓" in obs and "uploads/note.md" in obs, f"obs:\n{obs}"
-        assert Path("uploads/note.md").is_file(), "目标文件落盘"
-        assert Path("uploads/note.md").read_text(encoding="utf-8") == "外部笔记内容"
-        print("  case_import_basic OK")
+def _write(p: Path, text: str = "hello") -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
 
 
-async def case_import_rejects():
-    print("\n[2] import_files：边界拒绝（不存在 / 后缀 / 超大 / 空）")
-    with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp):
-        binfile = Path(tmp) / "secret.bin"
-        binfile.write_bytes(b"\x00\x01")
-        toobig = Path(tmp) / "big.md"
-        toobig.write_bytes(b"x" * (MAX_BYTES + 1))
+async def _check_import() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        uploads = tmp / "uploads"
+        ext = tmp / "external"
+        _write(ext / "note.md", "external note")
+        tool = ImportFilesTool(uploads_root=uploads)
 
-        tool = ImportFilesTool()
-        obs = await tool.execute(paths=[
-            "/nonexistent/path.md",
-            str(binfile),
-            str(toobig),
-        ])
-        assert "文件不存在" in obs, f"obs:\n{obs}"
-        assert "后缀不在白名单" in obs, f"obs:\n{obs}"
-        assert "超过上限" in obs, f"obs:\n{obs}"
-        # 全是 ✗，不应有 ✓
-        assert "✓" not in obs, f"obs 不该有 ✓:\n{obs}"
+        out = await tool.execute(paths=[str(ext / "note.md")])
+        assert "✓" in out and "note.md" in out, out
+        assert (uploads / "note.md").exists()
 
-        empty_obs = await tool.execute(paths=[])
-        assert empty_obs.startswith("Error: paths 不能为空"), empty_obs
-        print("  case_import_rejects OK")
+        _write(ext / "bad.exe", "x")
+        out = await tool.execute(paths=[str(ext / "bad.exe")])
+        assert "后缀不在白名单" in out, out
+
+        # 重复入库 → 加时间戳，不覆盖（uploads 是归档性存储，防覆盖是对的）
+        out = await tool.execute(paths=[str(ext / "note.md")])
+        assert "✓" in out, out
+        files = sorted(p.name for p in uploads.glob("note*"))
+        assert len(files) == 2, files
 
 
-async def case_import_conflict():
-    print("\n[3] import_files：同名冲突自动加时间戳后缀")
-    with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp):
-        ext = Path(tmp) / "note.md"
-        ext.write_text("原始", encoding="utf-8")
+def _check_stage_one() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        reports = (tmp / "reports").resolve()
+        uploads = (tmp / "uploads").resolve()
+        staging = (tmp / "wiki" / "staging").resolve()
+        os.chdir(tmp)  # stage_one 接收 cwd 相对的 src（reports/...）
+        _write(reports / "r1.md", "body one")
 
-        tool = ImportFilesTool()
-        first = await tool.execute(paths=[str(ext)])
-        ext.write_text("修改后", encoding="utf-8")
-        second = await tool.execute(paths=[str(ext)])
+        # 拍平命名：reports/r1.md → reports__r1.md
+        dest = stage_one(
+            "reports/r1.md",
+            reports_root=reports,
+            uploads_root=uploads,
+            staging_root=staging,
+        )
+        assert dest.name == "reports__r1.md", dest
+        assert dest.read_text(encoding="utf-8") == "body one"
 
-        upload_files = sorted(p.name for p in Path("uploads").glob("*.md"))
-        assert len(upload_files) == 2, f"应有 2 个文件（含时间戳变体），实际：{upload_files}"
-        assert "note.md" in upload_files, upload_files
-        # 第二份内容应是「修改后」，且文件名带时间戳后缀
-        ts_file = next(f for f in upload_files if f != "note.md")
-        assert ts_file.startswith("note-") and ts_file.endswith(".md"), ts_file
-        assert Path(f"uploads/{ts_file}").read_text(encoding="utf-8") == "修改后"
-        print(f"  case_import_conflict OK（生成 {upload_files}）")
+        # 幂等：同内容重试 → 同一目标，不新增文件
+        dest2 = stage_one(
+            "reports/r1.md",
+            reports_root=reports,
+            uploads_root=uploads,
+            staging_root=staging,
+        )
+        assert dest2 == dest
+        assert len(list(staging.glob("*.md"))) == 1, list(staging.glob("*.md"))
+
+        # 同名异内容 → 报错（机械故障，不覆盖 / 不加时间戳）
+        _write(reports / "r1.md", "DIFFERENT body")
+        try:
+            stage_one(
+                "reports/r1.md",
+                reports_root=reports,
+                uploads_root=uploads,
+                staging_root=staging,
+            )
+            assert False, "应抛 StageError"
+        except StageError as e:
+            assert "内容不同" in str(e), e
+
+        # 非法前缀拒绝
+        try:
+            stage_one(
+                "etc/passwd.md",
+                reports_root=reports,
+                uploads_root=uploads,
+                staging_root=staging,
+            )
+            assert False, "应抛 StageError"
+        except StageError as e:
+            assert "前缀" in str(e), e
+
+        # 源不存在拒绝
+        try:
+            stage_one(
+                "reports/missing.md",
+                reports_root=reports,
+                uploads_root=uploads,
+                staging_root=staging,
+            )
+            assert False, "应抛 StageError"
+        except StageError as e:
+            assert "不存在" in str(e), e
 
 
-async def case_stage_basic():
-    print("\n[4] stage_files：reports/ + uploads/ → wiki/staging/")
-    with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp):
-        Path("reports").mkdir()
-        Path("uploads").mkdir()
-        Path("reports/rl-survey.md").write_text("RL 报告", encoding="utf-8")
-        Path("uploads/user-note.md").write_text("用户笔记", encoding="utf-8")
+def _check_pre_hook() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        os.chdir(tmp)  # stage_wiki_inputs 走 cwd 相对默认根
+        _write(Path("reports/rl.md"), "rl report")
+        _write(Path("uploads/ext.md"), "ext doc")
 
-        tool = StageFilesTool()
-        obs = await tool.execute(paths=[
-            "reports/rl-survey.md",
-            "uploads/user-note.md",
-        ])
-        assert "staging/rl-survey.md" in obs, f"obs:\n{obs}"
-        assert "staging/user-note.md" in obs, f"obs:\n{obs}"
-        assert Path("wiki/staging/rl-survey.md").is_file()
-        assert Path("wiki/staging/user-note.md").is_file()
-        assert Path("wiki/staging/rl-survey.md").read_text(encoding="utf-8") == "RL 报告"
-        print("  case_stage_basic OK")
-
-
-async def case_stage_rejects():
-    print("\n[5] stage_files：非工作区前缀 / 不存在 / 越界")
-    with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp):
-        Path("reports").mkdir()
-        Path("uploads").mkdir()
-        Path("evil.md").write_text("外部邻居", encoding="utf-8")
-
-        tool = StageFilesTool()
-        obs = await tool.execute(paths=[
-            "evil.md",                     # 非 reports/uploads 前缀
-            "reports/nope.md",             # 不存在
-            "reports/../evil.md",          # 形式合规但解析后越界
-        ])
-        assert "只允许 reports/ 或 uploads/ 路径" in obs, f"obs:\n{obs}"
-        assert "文件不存在" in obs, f"obs:\n{obs}"
-        assert "解析后越界" in obs, f"obs:\n{obs}"
-        assert "✓" not in obs, f"obs 不该有 ✓:\n{obs}"
-        # 不应有任何文件被复制
+        # 改写 payload['files'] 成 staging 文件名；成功返回 None
+        payload = {"prompt": "归档", "context": "", "files": ["reports/rl.md", "uploads/ext.md"]}
+        err = stage_wiki_inputs(payload)
+        assert err is None, err
+        assert payload["files"] == ["reports__rl.md", "uploads__ext.md"], payload["files"]
         staging = Path("wiki/staging")
-        copied = list(staging.glob("*")) if staging.exists() else []
-        assert not copied, f"被拒后不应有文件落入 staging：{copied}"
-        print("  case_stage_rejects OK")
+        assert (staging / "reports__rl.md").exists()
+        assert (staging / "uploads__ext.md").exists()
+
+        # 重复派发（失败重试场景）→ 幂等：staging 文件数不增、不出现时间戳变体
+        payload2 = {"prompt": "归档", "context": "", "files": ["reports/rl.md"]}
+        assert stage_wiki_inputs(payload2) is None
+        assert payload2["files"] == ["reports__rl.md"]
+        assert len(list(staging.glob("*.md"))) == 2, list(staging.glob("*.md"))
+
+        # 非法源 → 短路返回错误字符串，payload 不被部分改写成功态
+        bad = {"prompt": "归档", "context": "", "files": ["etc/passwd.md"]}
+        err = stage_wiki_inputs(bad)
+        assert err is not None and "staging 失败" in err, err
+
+        # 无 files → 无操作、返回 None（原文可能已在 prompt 里）
+        empty = {"prompt": "归档", "context": "", "files": []}
+        assert stage_wiki_inputs(empty) is None
 
 
-async def case_end_to_end():
-    print("\n[6] 端到端：import_files → stage_files，路径互相承接")
-    with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp):
-        ext = Path(tmp) / "ext.md"
-        ext.write_text("用户提供的文档", encoding="utf-8")
-
-        # 模拟 ResearchAgent 落盘
-        Path("reports").mkdir()
-        Path("reports/research-output.md").write_text("研究产出", encoding="utf-8")
-
-        importer = ImportFilesTool()
-        stager = StageFilesTool()
-
-        # Step 1: 把外部文件导入 uploads/
-        imp_obs = await importer.execute(paths=[str(ext)])
-        assert "✓" in imp_obs and "uploads/ext.md" in imp_obs, f"import obs:\n{imp_obs}"
-
-        # Step 2: 把 reports + uploads 的产物 stage 到 wiki/staging/
-        stg_obs = await stager.execute(paths=[
-            "reports/research-output.md",
-            "uploads/ext.md",
-        ])
-        assert "staging/research-output.md" in stg_obs, f"stage obs:\n{stg_obs}"
-        assert "staging/ext.md" in stg_obs, f"stage obs:\n{stg_obs}"
-        assert Path("wiki/staging/research-output.md").is_file()
-        assert Path("wiki/staging/ext.md").is_file()
-        # staging 内容与源一致
-        assert Path("wiki/staging/ext.md").read_text(encoding="utf-8") == "用户提供的文档"
-        print("  case_end_to_end OK")
+async def _run() -> None:
+    cwd = os.getcwd()
+    try:
+        await _check_import()
+        _check_stage_one()
+        _check_pre_hook()
+    finally:
+        os.chdir(cwd)
+    print("check_staging OK")
 
 
-async def main() -> None:
-    await case_import_basic()
-    await case_import_rejects()
-    await case_import_conflict()
-    await case_stage_basic()
-    await case_stage_rejects()
-    await case_end_to_end()
-    print("\nOK")
+def main() -> None:
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

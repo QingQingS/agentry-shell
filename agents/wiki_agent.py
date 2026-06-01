@@ -36,6 +36,9 @@ DEFAULT_WIKI_ROOT = "wiki"
 NUDGE_TEXT = (
     "提醒：你已多次执行同一个工具调用并得到相同结果，似乎卡住了。"
     "请改变策略——换个路径/参数，或者如果工作已完成，直接用文字总结并结束（不要再调用工具）。"
+    "已经试过多个不同思路、仍拿不到足够信息 —— 也不要再空转或反复重试。"
+    "诚实地总结一下你目前的状态：你做到了什么、哪些没完成、为什么没完成"
+
 )
 
 
@@ -46,6 +49,9 @@ class WikiAgent(AgentInterface):
     async def run(self, task: str, **kwargs) -> AsyncIterator[AgentEvent]:
         # 生命周期/异常→error 由 core.runner 统一负责；这里只 yield 领域事件、失败时抛异常。
         context = (kwargs.get("context") or "").strip()
+        # files：派发时由 pre-hook（stage_wiki_inputs）搬进 staging/ 后改写成的 staging 内文件名。
+        # 直接结构化拿到，不再从 prompt 散文里正则抠路径（消灭脆弱性）。
+        files = [f for f in (kwargs.get("files") or []) if f]
         wiki_root = Path(kwargs.get("wiki_root") or DEFAULT_WIKI_ROOT)
         registry = build_wiki_registry(wiki_root)
         specs = registry.specs()
@@ -62,7 +68,10 @@ class WikiAgent(AgentInterface):
         catalog = build_catalog(wiki_root)   # 代码侧目录，注入 prompt（LLM 不再读 index.md）
         messages = [
             ChatMessage(role="system", content=WIKI_SCHEMA),
-            ChatMessage(role="user", content=self._format_input(today, catalog, context, task)),
+            ChatMessage(
+                role="user",
+                content=self._format_input(today, catalog, context, task, files),
+            ),
         ]
 
         touched: List[str] = []          # 本次成功写入/更新的页面（去重前）
@@ -100,7 +109,8 @@ class WikiAgent(AgentInterface):
                 break
 
             for call in resp.tool_calls:
-                sig = (call.name, json.dumps(call.arguments, sort_keys=True, ensure_ascii=False))
+                # sig = (call.name, json.dumps(call.arguments, sort_keys=True, ensure_ascii=False))
+                sig = (call.name,)
                 call_counts[sig] = call_counts.get(sig, 0) + 1
                 obs = await registry.execute(call)
                 messages.append(ChatMessage(role="tool", content=obs, tool_call_id=call.id))
@@ -152,7 +162,9 @@ class WikiAgent(AgentInterface):
     # ---- 辅助 ----
 
     @staticmethod
-    def _format_input(today: str, catalog: str, context: str, task: str) -> str:
+    def _format_input(
+        today: str, catalog: str, context: str, task: str, files: List[str]
+    ) -> str:
         parts = [
             f"今天的日期是 {today}。",
             "\nwiki 当前目录（系统维护，据此了解已有类别与页面；不必读 index.md）：",
@@ -163,6 +175,11 @@ class WikiAgent(AgentInterface):
                 "\n上游背景（供归档参考；若上游已含完整文档原文，直接基于此归档，不要再调 read_source）："
             )
             parts.append(context)
+        if files:
+            parts.append(
+                "\n待归档的源文档已就位（在 staging/ 内）。逐个用 read_source(path) 读取原文后归档，path 用下面的文件名："
+            )
+            parts.extend(f"- {name}" for name in files)
         parts.append("\n用户的归档指令：")
         parts.append(task or "（空——先用 list_files 看现状再决定下一步）")
         return "\n".join(parts)

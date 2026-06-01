@@ -38,16 +38,20 @@ class Config:
     )
 
     # ── Agent ────────────────────────────────────────
+    # 默认即 v2 hub（开箱跑通 hub-and-spoke）；v1 OrchestratorAgent 已 dormant，不再作默认。
     agent_class: str = field(
-        default_factory=lambda: os.getenv("AGENT_CLASS", "agents.echo_agent.EchoAgent")
+        default_factory=lambda: os.getenv(
+            "AGENT_CLASS", "agents.coordinator_agent.CoordinatorAgent"
+        )
     )
     verbose: bool = field(
         default_factory=lambda: os.getenv("VERBOSE", "true").lower() == "true"
     )
 
     # ── Retriever ────────────────────────────────────
+    # 默认 local（离线读 fixtures/，开箱即跑通、不触外网）；arxiv/tavily 按需切换。
     retriever: str = field(
-        default_factory=lambda: os.getenv("RETRIEVER", "arxiv,tavily")
+        default_factory=lambda: os.getenv("RETRIEVER", "local")
     )
     tavily_api_key: Optional[str] = field(
         default_factory=lambda: os.getenv("TAVILY_API_KEY")

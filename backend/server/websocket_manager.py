@@ -7,10 +7,9 @@ WebSocket Manager
   - 与具体 Agent 实现完全解耦（通过 AgentInterface 约定）
 """
 
-import asyncio
 import importlib
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 
 from fastapi import WebSocket
 
@@ -52,17 +51,17 @@ class WebSocketManager:
 
     def __init__(self, config: Optional[Config] = None):
         self.config = config or Config.from_env()
-        self.active: Dict[WebSocket, asyncio.Queue] = {}
+        self.active: Set[WebSocket] = set()   # 仅追踪活跃连接用于计数；事件直接经 _send_event 推送
         self._session_usage: Dict[WebSocket, TokenUsage] = {}
 
     async def connect(self, websocket: WebSocket) -> None:
         await websocket.accept()
-        self.active[websocket] = asyncio.Queue()
+        self.active.add(websocket)
         self._session_usage[websocket] = TokenUsage()
         logger.info(f"WebSocket connected. 当前连接数: {len(self.active)}")
 
     async def disconnect(self, websocket: WebSocket) -> None:
-        self.active.pop(websocket, None)
+        self.active.discard(websocket)
         self._session_usage.pop(websocket, None)
         logger.info(f"WebSocket disconnected. 当前连接数: {len(self.active)}")
 

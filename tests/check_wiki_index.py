@@ -14,12 +14,14 @@ Step 2a 验证：core/wiki_index.py —— index.md 的代码侧投影。
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from core.tools import ListFilesTool
 from core.wiki_index import build_catalog, collect_pages, regenerate_index
 
 
@@ -125,6 +127,32 @@ def main() -> int:
         check(broken.category == "未分类", "坏页归入「未分类」")
         cat = build_catalog(root)
         check("broken.md" in cat, "坏页仍出现在 catalog 里（不丢页）")
+
+    print("\n[5] staging/ 排除出目录与列举（T6）")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write(root, "AI/rag.md", PAGE_OK)
+        _write(root, "staging/raw-survey.md", PAGE_OK)   # 待归档原料，应被排除
+
+        # collect_pages / build_catalog 不含 staging
+        pages = collect_pages(root)
+        check([p.path for p in pages] == ["AI/rag.md"],
+              f"collect_pages 排除 staging/（实际 {[p.path for p in pages]}）")
+        cat = build_catalog(root)
+        check("staging/" not in cat, "catalog 不含 staging/ 条目")
+
+        # regenerate 后 index.md 不含 staging
+        idx = regenerate_index(root, today="2026-05-29")
+        check("staging/" not in idx, "重生 index.md 不含 staging/ 条目")
+
+        # ListFilesTool：默认列举排除 staging/ 与 index.md
+        lf = ListFilesTool(root.resolve())
+        full = asyncio.run(lf.execute())
+        check("staging/" not in full, "list_files() 默认输出不含 staging/")
+        check("AI/rag.md" in full, "list_files() 仍列出已策展页面")
+        # 显式 list_files('staging') 仍能发现待归档文件（curator 入口不被砍）
+        staged = asyncio.run(lf.execute(subdir="staging"))
+        check("staging/raw-survey.md" in staged, "list_files('staging') 仍列出待归档文件")
 
     print()
     if failures:

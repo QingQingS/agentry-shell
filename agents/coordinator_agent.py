@@ -23,16 +23,18 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from typing import AsyncIterator, List
 
 from core.agent_interface import AgentEvent, AgentInterface
-from core.dispatch import DispatchAgentTool
+from core.dispatch import DispatchAgentTool #tool
 from core.llm import ChatMessage, get_llm
 from core.registry import AgentRegistry, build_default_registry
-from core.staging import ImportFilesTool, StageFilesTool
-from core.tools import ToolRegistry
+from core.staging import ImportFilesTool #tool
+from core.tools import ReadFileTool, ToolRegistry, WikiSearchTool #tool
 
 MAX_ROUNDS = 10          # Coordinator 派发轮上限（防递归式无限分解）
+DEFAULT_WIKI_ROOT = "wiki"   # 只读 wiki 检索的根（与 WikiAgent 落点一致）
 
 # spoke 内部事件里，向用户冒泡（扇入）的类型；status/result/error 不冒泡
 # （status 是噪音；result 已作 observation，避免 dump；error 由 observation 承载）。
@@ -45,26 +47,31 @@ SCHEMA_TEMPLATE = """你是一个任务编排中枢（Coordinator）。你把用
 
 可用的工具：
 
-- dispatch_agent(agent, prompt, context): 把子任务派给一个 spoke。
+- dispatch_agent(agent, prompt, context, files): 把子任务派给一个 spoke。
   - agent：上面清单里的名字。
   - prompt：给该 agent 的自然语言子任务，必须自包含、指代已消解（agent 看不到本对话历史）。
   - context：可选背景，用于把上游 agent 的结果蒸馏后传给下游；无则留空。
+  - files：可选，要交给该 agent 处理的工作区文件路径（reports/... 或 uploads/...）。
+    归档文件时，把文件路径放进 files，不要塞进 prompt 散文里（prompt 只写归档意图）。
   - 返回 observation 含 status / summary / artifact 行（如果 spoke 落盘了产物，路径写在这里）/ report 段。
 
 - import_files(paths): 把用户提到的外部文件复制到 uploads/。
   paths 是用户给的外部路径列表（绝对或 ~ 路径）。返回每个文件入库后的工作区路径。
   **下游 spoke 永远不直接读外部 path**——任何外部文件必须先经 import_files 进入工作区。
 
-- stage_files(paths): 把 reports/ 或 uploads/ 下的文件复制到 wiki/staging/。
-  paths 必须以 reports/ 或 uploads/ 开头。返回 staging/ 内路径列表。
-  **派 wiki_curator 前必须先调本工具**——wiki_curator 只能读 staging/。
+- wiki_search(query): 在已归档的本地 wiki 里按关键词检索已有页面（只读）。
+  返回命中页面的 path/标题/片段。回答问题前可先查 wiki 复用已沉淀的知识；
+  只命中已策展页面（不含 staging/）。
+- read_file(path): 读取某个 wiki 页面的完整内容（path 相对 wiki 根，如 AI/rag.md）。
+  配合 wiki_search 使用：先搜到 path，再读全文，然后在答复里引用。
 
 跨 agent 数据流的标准模式：
 
 - 调研任务：dispatch_agent(researcher, ...) → 拿到 artifact: reports/xxx.md（researcher 强制落盘）。
-- 归档 researcher 的产出：stage_files(["reports/xxx.md"]) → dispatch_agent(wiki_curator,
-  "归档 staging/ 下的 xxx.md")。
-- 归档用户提供的外部文件：import_files([...]) → stage_files([...]) → dispatch_agent(wiki_curator, ...)。
+- 归档 researcher 的产出：dispatch_agent(wiki_curator, prompt="把这篇归档进 wiki，按主题归类",
+  files=["reports/xxx.md"])。文件搬运由系统在派发时完成，你不必（也无法）自己搬。
+- 归档用户提供的外部文件：import_files([...]) → dispatch_agent(wiki_curator,
+  prompt="把这些归档进 wiki", files=["uploads/xxx.md"])。
 - 简单追问能直接答 → 不必派发。
 
 分解原则：
@@ -85,8 +92,11 @@ class CoordinatorAgent(AgentInterface):
         registry: AgentRegistry = kwargs.get("registry") or build_default_registry()
         dispatch = DispatchAgentTool(registry, config=self.config, websocket=self.websocket)
         import_tool = ImportFilesTool()
-        stage_tool = StageFilesTool()
-        tools = ToolRegistry([dispatch, import_tool, stage_tool])
+        # 只读 wiki 检索：闭合 research→curate→reuse 的 reuse 一环（命中已归档页面并引用）。
+        wiki_root = Path(kwargs.get("wiki_root") or DEFAULT_WIKI_ROOT)
+        wiki_search = WikiSearchTool(wiki_root.resolve())
+        wiki_read = ReadFileTool(wiki_root.resolve())
+        tools = ToolRegistry([dispatch, import_tool, wiki_search, wiki_read])
         specs = tools.specs()
 
         llm = get_llm(tier="smart", config=self.config)
@@ -134,7 +144,7 @@ class CoordinatorAgent(AgentInterface):
 
             # 并行扇入：本轮所有 tool_call 并发驱动。
             # 两类调用混排：dispatch_agent → spoke 派发（事件流扇入）；
-            #             import_files / stage_files → 本地工具，直接 execute。
+            #             import_files / wiki_search / read_file → 本地工具，直接 execute。
             indexed = []
             for idx, call in enumerate(resp.tool_calls):
                 if call.name == "dispatch_agent":
@@ -167,11 +177,12 @@ class CoordinatorAgent(AgentInterface):
                             label,
                             call.arguments.get("prompt", ""),
                             call.arguments.get("context", ""),
+                            files=call.arguments.get("files"),
                             on_event=on_event,
                         )
                     except Exception as e:  # spoke 构造/驱动意外也不打断循环
                         return f"Error: 派发 {label} 失败: {type(e).__name__}: {e}"
-                # 本地工具（import_files / stage_files / 未知）走 ToolRegistry，
+                # 本地工具（import_files / wiki_search / read_file / 未知）走 ToolRegistry，
                 # 任何异常已被 ToolRegistry.execute 兜成 observation。
                 return await tools.execute(call)
 

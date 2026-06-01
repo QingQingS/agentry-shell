@@ -1,15 +1,30 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import socket
 import time
+import urllib.error
 from typing import List
 
 import arxiv
 
 from .base import BaseRetriever, SearchResult
 
-# ArXiv 要求请求间隔 ≥ 3 秒；429 时退避等待
+_log = logging.getLogger(__name__)
+
+# ArXiv 要求请求间隔 ≥ 3 秒；瞬时错误（429/503/连接）时退避等待
 _RETRY_WAITS = (10, 20, 40)   # 最多重试 3 次，等待时间（秒）
+
+# 可重试的瞬时错误：限流 / 服务端 5xx / 连接层问题。
+# arxiv 库把 HTTP 错误包成普通异常，故同时按异常类型与消息子串判定。
+_RETRIABLE_TOKENS = ("429", "503", "502", "500", "connection", "timeout", "timed out", "temporarily")
+
+
+def _is_retriable(exc: Exception) -> bool:
+    if isinstance(exc, (urllib.error.URLError, ConnectionError, TimeoutError, socket.timeout)):
+        return True
+    return any(tok in str(exc).lower() for tok in _RETRIABLE_TOKENS)
 
 
 class ArxivRetriever(BaseRetriever):
@@ -33,8 +48,12 @@ class ArxivRetriever(BaseRetriever):
                 return self._sync_search(query, max_results)
             except Exception as exc:
                 last_exc = exc
-                if "429" not in str(exc) or wait is None:
+                if not _is_retriable(exc) or wait is None:
                     raise
+                _log.warning(
+                    "arxiv 检索瞬时失败（%s），第 %d/%d 次退避 %ds 后重试：%s",
+                    type(exc).__name__, attempt + 1, len(_RETRY_WAITS), wait, exc,
+                )
                 time.sleep(wait)
         raise last_exc
 

@@ -15,12 +15,19 @@ Coordinator 不再 if/elif 硬编码路由，而是查这张表：
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
 from core.agent_interface import AgentInterface
+from core.staging import stage_wiki_inputs
 
 AgentFactory = Callable[..., AgentInterface]
+
+# pre-hook：在 spoke 真正启动前，对派发 payload（{prompt, context, files}）做改写 / 校验。
+# 原地改写 payload；成功返回 None；要中止派发就返回错误字符串（dispatch 转成 error observation）。
+# 挂在 AgentSpec 上、对 Coordinator 不可见——hook 是「派发某个 agent」的内部步骤。
+# （对称地，将来可加 post_hooks: Callable[[dict, str], Optional[str]] 收尾 / 改写产出。）
+PreHook = Callable[[dict], Optional[str]]
 
 
 @dataclass
@@ -32,6 +39,7 @@ class AgentSpec:
     input_contract: str       # 该给什么 prompt/context
     output_contract: str      # 会拿回什么
     factory: AgentFactory     # (config, websocket) -> 新 agent 实例
+    pre_hooks: List[PreHook] = field(default_factory=list)  # 派发前按序执行（见 PreHook）
 
 
 class AgentRegistry:
@@ -86,12 +94,16 @@ def build_default_registry() -> AgentRegistry:
                 "（读相关页、写/更新页、重生 index）。"
             ),
             input_contract=(
-                "prompt = 归档指令，含要处理的 .md 文件路径"
-                "（如「把 reports/foo.md 归档进 wiki」）；context = 可选背景。"
+                "prompt = 归档意图（如「把这些归档进 wiki，按主题归类」，不必写文件路径）；"
+                "files = 要归档的 reports/ 或 uploads/ 文件路径列表（系统会在派发时自动转入 "
+                "staging/ 并交给它读取，你不必也无法自己搬运）；context = 可选背景。"
             ),
-            output_contract="写入/更新了哪些 wiki 页面的摘要。",
+            output_contract="写入/更新了哪些 wiki 页面的摘要（index.md 由系统重生）。",
             factory=lambda config=None, websocket=None: WikiAgent(
                 config=config, websocket=websocket
             ),
+            # files 里的 reports//uploads/ 文件在派发前由 hook 幂等搬进 wiki/staging/，
+            # 并就地改写成 staging 内文件名（WikiAgent 只能读 staging/）。
+            pre_hooks=[stage_wiki_inputs],
         ),
     ])

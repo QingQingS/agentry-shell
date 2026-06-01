@@ -7,9 +7,14 @@ DeepSeek API 与 OpenAI 接口完全兼容，只需更换 base_url。
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, AsyncIterator, List, Optional
 
 from openai import AsyncOpenAI
+
+# per-call 超时（秒）：默认 60s，可经 LLM_TIMEOUT 环境变量覆盖。
+# 防止慢/挂的 LLM 调用阻塞整轮 ReAct（无超时时现场可 >2.5min 无产出）。
+_DEFAULT_LLM_TIMEOUT = 60.0
 
 from .base import BaseLLM, ChatMessage, LLMResponse, ToolCall, ToolSpec, TokenUsage
 
@@ -81,14 +86,18 @@ def _parse_tool_calls(message: Any) -> List[ToolCall]:
 class OpenAIProvider(BaseLLM):
     provider_name = "openai"
 
-    def __init__(self, *args: Any, **kwargs: Any):
+    def __init__(self, *args: Any, timeout: Optional[float] = None, **kwargs: Any):
         super().__init__(*args, **kwargs)
+        if timeout is None:
+            timeout = float(os.getenv("LLM_TIMEOUT", str(_DEFAULT_LLM_TIMEOUT)))
+        self.timeout = timeout
         self._client = AsyncOpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
+            timeout=timeout,
         )
 
-    async def chat(
+    async def _chat_impl(
         self,
         messages: List[ChatMessage],
         *,

@@ -29,14 +29,27 @@ from typing import AsyncIterator, List, Optional
 from agents.research_tools import SaveReportTool, build_research_registry
 from core.agent_interface import AgentEvent, AgentInterface
 from core.llm import ChatMessage, get_llm
-from core.retrievers import ArxivRetriever, BaseRetriever, TavilyRetriever
+from core.retrievers import ArxivRetriever, BaseRetriever, LocalFileRetriever, TavilyRetriever
 
 MAX_STEPS = 12          # 单次研究的 LLM 调用上限
 DUP_THRESHOLD = 3       # 同一 (tool, args) 重复多少次触发 nudge
+LOCAL_FIXTURES_DIR = "fixtures"   # RETRIEVER=local 时离线检索的语料目录
 
 NUDGE_TEXT = (
     "提醒：你已多次执行同一个工具调用并得到相同结果，似乎卡住了。"
-    "请改变策略——换工具/换参数，或者如果信息已够，直接用 markdown 写出最终报告（不要再调用工具）。"
+    "先停下来判断你属于以下哪种情况，再行动：\n"
+    "1) 还有没试过的路子 —— 换工具、换关键词、放宽或收窄检索、换信息源，"
+    "或把问题拆成更小的子问题分别查。不要重复同一个调用。\n"
+    "2) 现有信息已确实足够回答 —— 不要再调用任何工具，直接用 markdown 写出最终报告。\n"
+    "3) 已经试过多个不同思路、仍拿不到足够信息 —— 也不要再空转或反复重试。"
+    "直接用 markdown 写报告，如实标注这是不完整的结果：写清你查到了什么、"
+    "哪些没查到、为什么没查到（如来源不可达 / 需要登录 / 根本不存在 / 信息相互矛盾）、"
+    "试过哪些途径，以及若要继续接手、下一步可往哪个方向查。\n"
+    "   特例：如果连一条有用信息都没查到，那“什么都没找到”本身就是结论——"
+    "明确写出“未能找到任何相关信息”，列出试过且都失败的途径与可能原因"
+    "（很可能该主题不存在、检索不到、web问题或任务前提本身有误），而不是把报告硬填满。\n"
+    "无论哪种情况，都绝不要为了填补空缺而编造或臆测未经证实的内容——查不到就如实说查不到。"
+    "诚实的报告（哪怕只有部分、甚至完全空手），都优于硬凑，也优于无休止的重试。"
 )
 
 SYSTEM_PROMPT_TEMPLATE = """你是研究助理。手头有这些工具可用：
@@ -56,10 +69,16 @@ SYSTEM_PROMPT_TEMPLATE = """你是研究助理。手头有这些工具可用：
    - 读特定论文 / 看 README → fetch_url 抓全文。
    - 自己拆细问题分别查 → 多次 search_papers。
 2. 写最终 markdown 报告：开头一段总览，分点论述，结论收尾。
-3. **必须调 save_report(filename, content=完整报告) 把报告落盘**——这是契约要求，
-   Coordinator 要拿落盘路径转交给下游 agent；不落盘等于工作未完成。
-4. save_report 调完后，下一轮直接结束（不要再调任何工具；text content 简短确认即可）。
-
+3. **只有当报告确已写完时，才调 save_report(filename, content=完整报告)。**
+   调 save_report 等于你声明"这是一份完整成品"——Coordinator 会据此把产物转交下游。
+   （你确实写完却漏调时系统会兜底落盘，但那是安全网，别依赖。）
+   save_report 调完后下一轮直接结束：不再调任何工具，text 简短确认即可。
+4. 以下两种情况，不要调 save_report、也不要硬凑一份报告：
+   - 多方尝试后确实查不到任何有用信息：直接简短说明"未找到相关信息"及试过哪些途径，
+     不写空壳报告。
+   - 收到"接近步数/资源上限"的提醒、或自知写不完时：停止检索，把已查到的要点和
+     "哪些没做完"直接写进回复文本（不必 save_report），让系统据实标记为未完成。
+   无论哪种，都绝不为了凑成完整报告而编造未经证实的内容。
 今天的日期：{today}
 """
 
@@ -136,7 +155,8 @@ class ResearchAgent(AgentInterface):
                 break
 
             for call in resp.tool_calls:
-                sig = (call.name, json.dumps(call.arguments, sort_keys=True, ensure_ascii=False))
+                # sig = (call.name, json.dumps(call.arguments, sort_keys=True, ensure_ascii=False))
+                sig = (call.name,)
                 call_counts[sig] = call_counts.get(sig, 0) + 1
                 obs = await registry.execute(call)
                 messages.append(ChatMessage(role="tool", content=obs, tool_call_id=call.id))
@@ -174,9 +194,18 @@ class ResearchAgent(AgentInterface):
             if not final_content:
                 final_content = "（因达步数上限未能写出完整报告。）"
 
-        # 落盘兜底：LLM 未调 save_report（漏调或触顶提前结束）时，由代码强制落盘 final_content。
-        # 跨 agent 数据走文件系统的契约不能由 LLM 单方面打破，所以必须有 artifact。
-        if artifact_path is None and final_content.strip():
+        # status 判定提前到兜底落盘之前：调过工具且全部空 → degenerate（检索无结果）。
+        # 无工具调用（纯对话答复）也算 ok。
+        is_degenerate = retrieval_calls > 0 and retrieval_hits == 0
+
+        # 落盘兜底：仅当循环自然结束（LLM 主动停）却漏调 save_report 时，由代码强制落盘
+        # final_content，保证跨 agent 的 artifact 契约不被 LLM 单方面打破。
+        # 不兜底的两种情况：
+        #   - 触顶提前结束（not stopped_naturally）：研究没做完、没产出完整报告，落盘只会把
+        #     占位/半成品写进 reports/，据实留作未完成、不产 artifact。
+        #   - degenerate（检索全空）：否则会把"未找到"的空壳报告写进 reports/，再经
+        #     stage_files 泄漏进 wiki（与 T6 同向，保持产物干净）。
+        if stopped_naturally and not is_degenerate and artifact_path is None and final_content.strip():
             artifact_path = self._fallback_save(reports_root, task, final_content)
             yield AgentEvent(
                 type="log",
@@ -190,9 +219,12 @@ class ResearchAgent(AgentInterface):
             metadata={**total.to_dict(), "scope": "cumulative"},
         )
 
-        # status：调过工具且全部空 → degenerate；否则 ok。无工具调用（纯对话答复）也算 ok。
-        if retrieval_calls > 0 and retrieval_hits == 0:
+        if is_degenerate:
             status, summary = "degenerate", "（未检索到相关结果）"
+        elif not stopped_naturally:
+            # 触顶提前结束：研究没做完、未产出完整报告（上面已跳过兜底落盘，无 artifact）。
+            # 据实标记为未完成，让 Coordinator 知道这不是一份成品、勿当成功转交下游。
+            status, summary = "incomplete", "（达步数上限，研究未完成）"
         else:
             status, summary = "ok", self._first_paragraph(final_content)
         result_meta = {"status": status, "summary": summary}
@@ -221,6 +253,9 @@ class ResearchAgent(AgentInterface):
                 retrievers.append(
                     TavilyRetriever(api_key=getattr(self.config, "tavily_api_key", None))
                 )
+            elif name == "local":
+                # 离线模式：从本地语料目录（fixtures/）做关键词检索，不触任何外网。
+                retrievers.append(LocalFileRetriever(LOCAL_FIXTURES_DIR))
             else:
                 retrievers.append(ArxivRetriever())
         return retrievers or [ArxivRetriever()]

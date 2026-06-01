@@ -1,7 +1,7 @@
 # Agentry-Shell
 
 A from-scratch, extensible **LLM agent runtime**. Not a framework wrapper — every layer
-(agent lifecycle, event protocol, intent-driven orchestration, ReAct tool loop, streaming
+(agent lifecycle, event protocol, hub-and-spoke orchestration, ReAct tool loops, streaming
 transport, pluggable LLM providers and retrievers) is built and owned here, to understand how
 a real agent system fits together.
 
@@ -10,72 +10,110 @@ Drop in a new agent class, an LLM provider, or a retriever — the infrastructur
 
 The architecture began as a study of [gpt-researcher](https://github.com/assafelovic/gpt-researcher) —
 its retriever/agent layering was the starting reference — and then grew its own agent runtime,
-event protocol, intent-driven orchestrator, and ReAct tool loop. Nothing is imported as a black box;
-every layer is reimplemented to understand it.
+event protocol, orchestrator, and ReAct tool loops. Nothing is imported as a black box; every
+layer is reimplemented to understand it. The orchestration layer itself went through a redesign
+(v1 fixed intent-routing → v2 emergent ReAct decomposition); see
+[Design evolution](#design-evolution-v1--v2) below.
 
 ```
 User (CLI / Web UI / REST)
         │
         ▼
-   run_agent()                      ← unified lifecycle + status/error wrapper (core/runner.py)
-        │                             agents only yield domain events & raise on failure
+   run_agent()                       ← unified lifecycle + status/error wrapper (core/runner.py)
+        │                              agents only yield domain events & raise on failure
         ▼
-  OrchestratorAgent                 ← the conversation brain (AGENT_CLASS)
-   ├─ SessionManager                ← cross-turn memory: turns + a rolling report window
-   ├─ classify_intent (fast LLM)    ← one call → {route, mode, target, carry_context, files}
-   └─ dispatch by route:
-        ├─ research → ResearchAgent  ← multi-source retrieval + streamed report
-        ├─ chat     → ChatAgent      ← answers from carried-over context, no new retrieval
-        └─ wiki     → WikiAgent      ← ReAct tool loop, curates a persistent ./wiki/ knowledge base
+  CoordinatorAgent (hub)             ← a ReAct loop; its tools are dispatch_agent / stage_files / import_files
+        │  decomposes the task on the fly, dispatches spokes (parallel or serial as deps demand),
+        │  and consumes back only each spoke's summary + artifact path (not the full report)
+        ├─ dispatch_agent(researcher) → ResearchAgent  ← inner ReAct loop: search_papers / search_web /
+        │                                                fetch_url / do_broad_survey → saves a report artifact
+        └─ dispatch_agent(wiki_curator) → WikiAgent    ← inner ReAct loop: curates a persistent ./wiki/
+                                                          from files staged into wiki/staging/
 ```
+
+The hub never inlines a spoke's full transcript or report into its own context; it passes
+**summaries and artifact paths** between agents and lets downstream spokes read the files. That
+context discipline is the same lever behind the [−72% token](#optimizing-the-react-loop-measured)
+result on the wiki loop.
 
 ## Agents at a glance
 
-The runtime currently ships these agents. Pick a hub via `AGENT_CLASS`; spokes are
-invoked by the hub or directly.
+Pick a hub via `AGENT_CLASS` (default: `CoordinatorAgent`); spokes are invoked by the hub or directly.
 
-**Hubs**
-- `CoordinatorAgent` (v2, active) — itself a ReAct loop whose only tool is
-  `dispatch_agent`. Decomposes a request on the fly and dispatches spokes in
-  parallel or serially as dependencies demand. Replaces the v1 intent-classified
-  routing shown in the diagram above.
-- `OrchestratorAgent` (v1) — one fast-LLM intent classification per turn → fixed
-  route to a single worker. Still present; this is the path the diagram depicts.
+**Hub (active)**
+- `CoordinatorAgent` (v2, **default**) — itself a ReAct loop whose tools are `dispatch_agent`,
+  `stage_files`, and `import_files`. Decomposes a request on the fly and dispatches spokes in
+  parallel or serially as dependencies demand, then synthesizes the final answer.
+
+**Hub (dormant)**
+- `OrchestratorAgent` (v1, **dormant**) — one fast-LLM intent classification per turn → a fixed
+  route to a single worker, with cross-turn session memory. Kept for reference and contrast; it is
+  no longer the default and its `wiki` route is deprecated (see [Design evolution](#design-evolution-v1--v2)).
 
 **Spokes**
-- `ResearchAgent` — its own ReAct loop with `search_papers` (arXiv),
-  `search_web` (Tavily), `fetch_url`, and `do_broad_survey`. The LLM picks tools
-  per request; there is no `mode` switch.
-- `WikiAgent` — ReAct loop that ingests `.md` files and curates the persistent
-  `./wiki/` knowledge base. File tools run in a path-sandboxed registry; the
-  deterministic `index.md` is regenerated by code from each page's frontmatter,
-  never written by the LLM.
-- `ChatAgent` — single-turn Q&A that can carry the previous report as
-  background. Under v2 this collapses into Coordinator's "zero dispatch" path.
+- `ResearchAgent` — its own ReAct loop with `search_papers` (arXiv), `search_web` (Tavily),
+  `fetch_url`, and `do_broad_survey`. The LLM picks tools per request; there is no `mode` switch.
+  It always persists its report as an artifact under `reports/` so the hub can hand the path downstream.
+- `WikiAgent` (dispatched as `wiki_curator`) — ReAct loop that ingests `.md` files staged into
+  `wiki/staging/` and curates the persistent `./wiki/` knowledge base. File tools run in a
+  path-sandboxed registry; the deterministic `index.md` is regenerated by code from each page's
+  frontmatter, never written by the LLM, and `staging/` is excluded from the curated index.
+- `ChatAgent` — single-turn Q&A; under v2 this collapses into Coordinator's "zero dispatch" path.
 - `EchoAgent` — zero-LLM reference agent for verifying the CLI / WebSocket pipeline.
 
 ### Example: a composite task end-to-end
 
-> *"Survey recent work on RL and on agent frameworks in parallel, then analyze
-> the vLLM repo, and archive everything into the wiki."*
+> *"Survey recent work on RL and on agent frameworks in parallel, then analyze the vLLM repo,
+> and archive everything into the wiki."*
 
 Under `CoordinatorAgent` this becomes nested ReAct loops:
 
 1. **Round 1** — three independent subtasks, dispatched in one round (concurrent):
    - `dispatch_agent(researcher, "Survey recent RL progress …")` → `ResearchAgent` runs `do_broad_survey`.
-   - `dispatch_agent(researcher, "Survey recent agent-framework progress …")` → a second `ResearchAgent` instance in parallel.
-   - `dispatch_agent(researcher, "Analyze the vLLM repo …")` → a third instance reaches for `search_web` + `fetch_url` to read READMEs / source.
-2. **Round 2** — dependent on Round 1's observations:
-   `dispatch_agent(wiki_curator, "Archive the three reports above …", context=…)`
-   → `WikiAgent` writes/updates `./wiki/` pages; code regenerates `index.md`.
+   - `dispatch_agent(researcher, "Survey recent agent-framework progress …")` → a second instance in parallel.
+   - `dispatch_agent(researcher, "Analyze the vLLM repo …")` → a third reaches for `search_web` + `fetch_url`.
+2. **Round 2** — dependent on Round 1: `stage_files([...the three report artifacts...])` →
+   `dispatch_agent(wiki_curator, "Archive staging/ …", context=…)` → `WikiAgent` writes/updates
+   `./wiki/` pages; code regenerates `index.md`.
 3. **Round 3** — no tool calls; Coordinator emits the final markdown synthesis.
    `spokes_used` is reported in event metadata, not in the body.
 
-Single-agent invocations work too: `python cli.py "Survey speculative decoding"`
-goes to `ResearchAgent`; `python cli.py "wiki ./reports/foo.md"` goes to `WikiAgent`.
+Single-spoke invocations work too — the hub simply decomposes into one dispatch:
+`python cli.py "Survey speculative decoding"`.
+
+## Design evolution: v1 → v2
+
+The orchestration layer was rebuilt once, and the contrast is the most interesting part of the project.
+
+**v1 — fixed intent routing (`OrchestratorAgent`, now dormant).** Each turn ran one fast-LLM
+classification into orthogonal axes (`route` / `mode` / `target` / `carry_context` / `files`) and
+routed to exactly one worker, with a `SessionManager` carrying prior reports for cross-turn
+follow-ups. It worked, but the routing table was a bottleneck: every new capability meant a new
+`route` arm and new classification examples, composite requests ("survey A **and** B, then archive
+both") didn't fit a single route, and the fixed `mode` enum pre-decided *how* a worker should work
+instead of letting it decide.
+
+**v2 — emergent ReAct decomposition (`CoordinatorAgent`, default).** The hub is itself a ReAct loop
+whose only routing primitive is `dispatch_agent`. There is no intent table: the LLM reads a registry
+catalog of spokes and decides *who* to call, *with what self-contained prompt*, and *in what order* —
+emitting multiple dispatches in one round when subtasks are independent, or serializing when a
+downstream prompt needs an upstream artifact. Spokes became agentic too (`ResearchAgent` picks its
+own tools instead of obeying a `mode`). The hub↔spoke contract is deliberately narrow: a spoke
+returns a one-line summary + an artifact path, and the hub passes those on rather than re-inlining
+full reports — keeping the hub's context small on long composite tasks.
+
+**Capability boundary (read this before judging scope).**
+- **v2 decomposes *within a single task*** — it has **no cross-turn memory**. Each `cli.py` invocation
+  (and each `--interactive` line) is independent; the Coordinator does not remember previous turns.
+- **Cross-turn session memory was a v1 capability** (`SessionManager`), and v1 is dormant. Re-wiring
+  session memory onto the v2 hub is explicitly *future work*, not a current feature.
 
 ## Highlights
 
+- **Hub-and-spoke ReAct orchestration.** `CoordinatorAgent` decomposes a request by *reasoning*, not
+  by a routing table: it dispatches spokes (in parallel or serially), passes only summaries +
+  artifact paths between them, and synthesizes the result. No fixed intent enum, no per-capability
+  routing code.
 - **Agent runtime / harness.** A single `AgentInterface` contract + `run_agent()` driver own the
   whole lifecycle (`on_start` → `running` → `done` / `error`). Agents stay simple: implement one
   async generator, `yield` domain events, raise on failure. Status/error emission is never the
@@ -83,15 +121,12 @@ goes to `ResearchAgent`; `python cli.py "wiki ./reports/foo.md"` goes to `WikiAg
 - **Uniform event protocol.** Every agent speaks `AgentEvent` (`log` / `stream` / `result` /
   `status` / `tokens`). The same stream drives the CLI, the WebSocket, and the Web UI — transports
   are decoupled from agents.
-- **Intent-driven orchestration.** `OrchestratorAgent` turns a series of stateless workers into a
-  coherent multi-turn conversation. One fast-LLM call classifies each input along orthogonal axes
-  (`route` / `mode` / `target` / `carry_context` / `files`) and routes it. Pronoun resolution and
-  follow-ups work because the orchestrator carries prior reports as background.
-- **A real ReAct agent.** `WikiAgent` is genuinely agentic: an LLM tool-calling loop that decides
-  which wiki pages to read/write and how to update the index, integrating documents into a
-  topic-centric knowledge base. Tools run in a path-sandboxed registry (`./wiki/` only, blocks
-  traversal / absolute / symlink escapes), tools never raise (failures become observations), and the
-  loop has loop-breaking guards (duplicate-call nudge, `MAX_STEPS` cap).
+- **Real ReAct agents with guardrails.** Both `ResearchAgent` and `WikiAgent` are genuine
+  tool-calling loops. Tools run in sandboxed registries (the wiki tools are confined to `./wiki/`,
+  blocking traversal / absolute / symlink escapes), tools never raise (failures become observations,
+  so the loop is never broken by a tool), and loops have breakers (duplicate-call nudge, `MAX_STEPS`
+  cap). Retrieval/LLM calls have per-call timeouts and transient-error retry-with-backoff that turns
+  failures into observations instead of hanging the turn.
 - **Pluggable everywhere.** LLM providers (OpenAI / DeepSeek; Anthropic text path) behind a
   `factory` with `smart` / `fast` tiers; retrievers (arXiv / Tavily / local files) behind a
   `BaseRetriever`; agents loaded dynamically via `AGENT_CLASS`. Adding any of these touches no core code.
@@ -114,13 +149,16 @@ wiki on that fixture:
 
 - *Build the instrument first.* Single-run token counts on an ambiguous, multi-topic document were
   dominated by curation variance (the model created 1 vs 3 pages run-to-run), swamping the signal.
-  A fixed single-topic fixture (`tests/fixtures/`, with a git-tracked baseline wiki and a one-command
-  reset) made each change's effect legible.
+  A fixed single-topic fixture with a git-tracked baseline wiki and a one-command reset made each
+  change's effect legible.
 - *A falsified hypothesis redirected the effort.* Pruning the model's accumulated `reasoning_content`
   looked like the largest lever — but the thinking-mode API rejects any tool-call turn that drops it,
   so the reasoning can't be removed from history. The effort shifted to removing the *turns* that
   accumulate it: judging relevance from the index instead of reading pages, and pushing index
   maintenance out of the loop into deterministic code.
+
+The same "pass summaries + artifact paths, not full transcripts" principle is what keeps the v2 hub's
+context small across multi-spoke tasks.
 
 ## Quick start
 
@@ -143,26 +181,45 @@ LLM_PROVIDER=deepseek
 DEEPSEEK_API_KEY=sk-...
 SMART_LLM_MODEL=deepseek-chat
 FAST_LLM_MODEL=deepseek-chat
-AGENT_CLASS=agents.orchestrator_agent.OrchestratorAgent
-RETRIEVER=arxiv                 # or: tavily / arxiv,tavily (Tavily needs TAVILY_API_KEY)
+AGENT_CLASS=agents.coordinator_agent.CoordinatorAgent   # v2 hub (default)
+RETRIEVER=local                 # offline fixtures (default); or: arxiv / tavily / arxiv,tavily
 ```
 
-Run it:
+### 60-second offline demo
+
+`RETRIEVER=local` runs retrieval entirely off a cached local corpus (`fixtures/`) — **no external
+search service** (no arXiv / Tavily), so the demo is reproducible on a flaky network. You still need
+one LLM API key (the agent's reasoning loop calls the model).
 
 ```bash
-# One-shot task
+bash scripts/demo.sh
+# → ResearchAgent runs its ReAct loop over fixtures/, writes a report into reports/, all offline-retrieval.
+```
+
+> 📹 **Demo recording placeholder** — an asciinema cast / GIF of the 60-second demo will live here.
+> *(TODO: record `scripts/demo.sh` and embed.)*
+
+Run the general entry points:
+
+```bash
+# One-shot task (default hub = CoordinatorAgent; default retriever = local)
 python cli.py "Survey recent work on speculative decoding"
 
-# Multi-turn conversation (session memory across turns)
+# Interactive REPL — runs each line as an independent task (v2 has no cross-turn memory)
 python cli.py --interactive
 
 # Web service → http://localhost:8000  (FastAPI + WebSocket + minimal UI)
 python main.py
 ```
 
-In `--interactive` mode the orchestrator remembers the conversation, so you can follow up
-("what did that report mean by X?"), pivot ("forget that, research Y"), or archive
-("save ./reports/foo.md into the wiki") and watch it route to the right agent.
+### Running the checks
+
+There is no `pytest` suite yet; the verification scripts under `tests/` are runnable one-by-one and
+are all offline (they stub the LLM and retrievers, no API key needed):
+
+```bash
+for f in tests/check_*.py; do python "$f"; done
+```
 
 ## Layout
 
@@ -170,20 +227,27 @@ In `--interactive` mode the orchestrator remembers the conversation, so you can 
 core/
   agent_interface.py   # AgentInterface + AgentEvent — the contract every agent implements
   runner.py            # run_agent(): lifecycle + status/error, owned in one place
-  session.py           # SessionManager: turns + rolling report window, persisted to ./reports/
-  intent.py            # classify_intent → {route, mode, target, carry_context, files}
+  dispatch.py          # dispatch_agent tool: isolated spoke run → summary + artifact observation
+  registry.py          # AgentRegistry: spoke catalog + factories the hub dispatches against
+  staging.py           # import_files / stage_files: move files into uploads/ and wiki/staging/
+  session.py           # SessionManager: turns + rolling report window (v1; dormant)
+  intent.py            # classify_intent (v1 routing; dormant)
   tools.py             # Tool / ToolRegistry + sandboxed file tools for the wiki
+  wiki_index.py        # deterministic index.md projection from page frontmatter
   config.py            # config resolution: env > .env > defaults
   llm/                 # BaseLLM, OpenAI/DeepSeek/Anthropic providers, factory, tool-calling path
   retrievers/          # BaseRetriever + arXiv / Tavily / local-file sources
 agents/
-  orchestrator_agent.py  # continuous-conversation orchestrator (the brain)
-  research_agent.py      # multi-source concurrent retrieval + streamed report (survey/paper/code modes)
+  coordinator_agent.py   # v2 hub: emergent ReAct decomposition over a spoke registry
+  research_agent.py      # spoke: inner ReAct loop, multi-source retrieval → report artifact
+  research_tools.py      # ResearchAgent's private tool layer
+  wiki_agent.py          # spoke: ReAct tool loop — persistent knowledge curation
   chat_agent.py          # context-aware single-turn chat
-  wiki_agent.py          # ReAct tool loop — persistent knowledge curation
+  orchestrator_agent.py  # v1 intent-routing orchestrator (dormant)
   echo_agent.py          # zero-LLM reference agent
 backend/server/          # FastAPI routes + WebSocket manager
 frontend/                # minimal HTML / JS / CSS client
+fixtures/                # cached corpus for the offline RETRIEVER=local demo
 cli.py  main.py          # CLI and web entry points
 ```
 
@@ -205,22 +269,23 @@ class MyAgent(AgentInterface):
 AGENT_CLASS=agents.my_agent.MyAgent python cli.py "..."
 ```
 
-To teach the orchestrator a new capability, add a `route` arm in `core/intent.py` (a route value,
-its payload, a few classification examples) and a dispatch branch in `orchestrator_agent.py` —
-the `research` / `chat` / `wiki` paths stay untouched. New LLM providers and retrievers slot in
-behind `core/llm/factory.py` and `BaseRetriever` the same way.
+**Add a spoke to the v2 hub** — register an `AgentSpec` (name, when-to-use description, input/output
+contract, factory) in `core/registry.py`. The Coordinator picks it up from the catalog automatically;
+no routing code to touch. New LLM providers and retrievers slot in behind `core/llm/factory.py` and
+`BaseRetriever` the same way.
 
 ## Status & roadmap
 
-Actively developed as a learning project. The agent runtime, multi-source research,
-continuous-conversation orchestration, and the ReAct WikiAgent are all implemented and runnable
-end-to-end against a real LLM.
+Actively developed as a learning project. The agent runtime, the v2 hub-and-spoke Coordinator,
+multi-source research, and the ReAct WikiAgent are all implemented and runnable end-to-end against a
+real LLM; the offline `RETRIEVER=local` path runs the retrieval side with no external network.
 
-In progress toward review-grade quality: folding the existing `tests/check_*.py` verification
-scripts into a one-command `pytest` suite, tightening a couple of known rough edges (agent
-auto-import, the synchronous `POST /api/run` path), and removing dead code.
+Known rough edges (disclosed, not yet addressed): the WebSocket multi-spoke token accounting,
+the synchronous `POST /api/run` path, the Anthropic tool path (currently text-only), and folding the
+`tests/check_*.py` scripts into a one-command `pytest` suite. The v1 `OrchestratorAgent` is dormant.
 
-Planned next: long-term memory / storage, and letting `ChatAgent` query the curated wiki.
+Planned next: re-wiring cross-turn memory onto the v2 hub, and letting the Coordinator query the
+curated wiki (read-back) so research → curate → reuse closes the loop.
 
 ## Tech
 

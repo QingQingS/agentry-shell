@@ -10,9 +10,12 @@ LLM 抽象层基础接口。
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+import time
+from abc import ABC
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable, List, Literal, Optional
+
+from core.trace import LLMTracer
 
 
 Role = Literal["system", "user", "assistant", "tool"]
@@ -110,8 +113,10 @@ class BaseLLM(ABC):
         self.base_url = base_url
         self.on_tokens = on_tokens
         self._cumulative_usage = TokenUsage()
+        # 无损增量追踪：tap 在此基类（所有 provider 之下）→ 新 provider 实现
+        # _chat_impl 即自动被记，无需各自插桩。详见 core/trace.py。
+        self._tracer = LLMTracer(self.provider_name, model)
 
-    @abstractmethod
     async def chat(
         self,
         messages: List[ChatMessage],
@@ -122,19 +127,47 @@ class BaseLLM(ABC):
         **kwargs: Any,
     ) -> LLMResponse:
         """
-        非流式调用。等待完整响应，返回 LLMResponse。
+        非流式调用（模板方法）：tap 追踪 + 委派给子类 _chat_impl。
 
-        tools 非空时启用工具调用：Provider 负责把 ToolSpec 翻译成自家
-        wire 格式，并把响应里的工具调用解析回 LLMResponse.tool_calls。
-        ReAct 循环不在此层——本方法只完成单次调用的归一化。
+        全系统所有 agent 都经此唯一咽喉调 LLM，故在此落「输入增量 + 完整响应」即可
+        无损复盘任意一次 ReAct，且 agent 零改动。真实调用由各 Provider 的 _chat_impl
+        完成，本方法不碰 wire 细节。
+        """
+        self._tracer.on_request(messages)
+        t0 = time.monotonic()
+        resp = await self._chat_impl(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            **kwargs,
+        )
+        self._tracer.on_response(resp, time.monotonic() - t0)
+        return resp
 
-        子类实现要点：
+    async def _chat_impl(
+        self,
+        messages: List[ChatMessage],
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[ToolSpec]] = None,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        """
+        单次调用的归一化实现，由各 Provider 覆盖（不设 @abstractmethod，以免
+        直接覆盖 chat() 的测试 fake 因未实现本方法而无法实例化）。
+
+        tools 非空时启用工具调用：Provider 负责把 ToolSpec 翻译成自家 wire 格式，
+        并把响应里的工具调用解析回 LLMResponse.tool_calls。ReAct 循环不在此层。
+
+        实现要点：
             1. 调用 SDK
             2. 从响应提取 usage，构造 TokenUsage
             3. await self._record_usage(usage) 触发回调与累计
             4. 返回 LLMResponse
         """
-        ...
+        raise NotImplementedError
 
     async def chat_stream(
         self,

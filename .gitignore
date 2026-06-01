@@ -18,3 +18,7 @@ run.sh
 # macOS
 .DS_Store
 .claude/
+
+# LLM 调用追踪（core/trace.py，默认开）
+traces/
+trace.log
