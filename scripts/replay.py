@@ -82,6 +82,15 @@ def _render_run(rid, depth, by_run, children, out, max_chars) -> None:
 def _render_record(r: dict, depth, out, max_chars) -> None:
     pad = "  " * depth
     p = r.get("payload", {})
+    if r.get("kind") == "context_edited":
+        # 步4 守卫记录：上下文被裁剪/改写。基线已切到 snapshot；此处只示警，
+        # 快照原文留在文件里供程序化重建。
+        out.append(
+            f"{pad}⚠ [context-edited] 上下文被改写："
+            f"old_len={p.get('old_len')} → new_len={p.get('new_len')}"
+            f"（首个改动位 diverged_at={p.get('diverged_at')}，快照 {len(p.get('snapshot', []))} 条）"
+        )
+        return
     if r.get("kind") == "msg":
         role = p.get("role", "?")
         if role == "tool":

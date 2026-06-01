@@ -26,6 +26,7 @@ LLM 调用的无损增量追踪 —— 把每次 chat() 的完整输入增量与
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import json
 import os
 import time
@@ -64,6 +65,12 @@ def serialize_response(resp: Any) -> dict:
 
 def _serialize_tool_call(tc: Any) -> dict:
     return {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+
+
+def _fingerprint(m: Any) -> str:
+    """消息的稳定指纹，用于探测「已记录的前缀是否被改写/截断」（步4 守卫）。"""
+    blob = json.dumps(serialize_message(m), sort_keys=True, ensure_ascii=False)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
 
 
 # ---- run 作用域（跨 agent 层级）---------------------------------------------
@@ -197,18 +204,45 @@ class LLMTracer:
         self.provider = provider
         self.model = model
         self.stream_id = uuid.uuid4().hex[:8]
-        self._hwm = 0      # 已记录到 messages 的哪个下标
-        self._seq = 0      # 该流内单调序号，供 replay 排序
+        self._hwm = 0           # 已记录到 messages 的哪个下标
+        self._seq = 0           # 该流内单调序号，供 replay 排序
+        self._fps: List[str] = []   # 已记录各位置的指纹，用于探测前缀被改写（步4）
 
     def on_request(self, messages: List[Any]) -> None:
-        """落输入尾巴里的非 assistant 消息（seed / 工具结果 / 注入）。"""
+        """落输入增量。正常（append-only）只落尾巴里的非 assistant 消息
+        （seed / 工具结果 / 注入）；assistant 答复由 on_response 承载，避免重复。
+
+        步4 守卫：若已记录的前缀被改写或截断（未来上下文压缩/裁剪），增量假设失效，
+        改落一条 context_edited 事件 + 全量 resync 快照——「历史被动过」本身留痕，
+        且文件仍能据快照无损重建当前上下文。replay 见到此记录即把基线切到 snapshot。"""
         if not _sink.enabled:
             return
-        for m in messages[self._hwm:]:
-            if m.role == "assistant":
-                continue   # assistant 答复由 on_response 承载，避免重复
-            self._emit("msg", serialize_message(m))
-        self._hwm = len(messages)
+        n = len(messages)
+        diverged_at = self._find_divergence(messages, n)
+        if diverged_at is not None:
+            self._emit("context_edited", {
+                "diverged_at": diverged_at,
+                "old_len": self._hwm,
+                "new_len": n,
+                "snapshot": [serialize_message(m) for m in messages],
+            })
+        else:
+            for m in messages[self._hwm:]:
+                if m.role == "assistant":
+                    continue
+                self._emit("msg", serialize_message(m))
+        self._fps = [_fingerprint(m) for m in messages]
+        self._hwm = n
+
+    def _find_divergence(self, messages: List[Any], n: int) -> Optional[int]:
+        """返回前缀首个被改写的下标；纯截断（前缀一致但变短）返回新长度；否则 None。"""
+        limit = min(self._hwm, n)
+        for i in range(limit):
+            if _fingerprint(messages[i]) != self._fps[i]:
+                return i
+        if n < self._hwm:
+            return n
+        return None
 
     def on_response(self, resp: Any, dt: float) -> None:
         """落本次返回的完整响应（assistant 增量）。"""

@@ -132,6 +132,9 @@ async def case_lossless_recovery():
         "assistant 不该作为 msg 重复出现（已由 response 承载）"
     seqs = [r["seq"] for r in recs]
     assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs), "seq 应单调且唯一"
+    # 正常 append-only 流不该误触发步4 守卫
+    assert not any(r["kind"] == "context_edited" for r in recs), \
+        "append-only 流不应产生 context_edited"
     print(f"  case_lossless_recovery OK（{len(recs)} 条记录）")
 
 
@@ -246,8 +249,47 @@ async def case_replay():
     print("  case_replay OK")
 
 
+async def case_append_only_guard():
+    """步4：前缀被改写/截断（未来上下文压缩）时落 context_edited + 快照，不静默丢数据。"""
+    sys0 = ChatMessage(role="system", content="原系统提示")
+    user0 = ChatMessage(role="user", content="原任务")
+    asst1 = ChatMessage(role="assistant", content="思考",
+                        tool_calls=[ToolCall(id="c1", name="search", arguments={"q": "x"})])
+    tool1 = ChatMessage(role="tool", content="检索结果原文", tool_call_id="c1")
+
+    # —— 改写：第三次请求时，前缀第 0 位 system 被换掉、整体压缩成 2 条 ——
+    tr = trace.LLMTracer("fake", "fake-model")
+    sid = tr.stream_id
+    tr.on_request([sys0, user0])                  # append: 2 条 msg
+    tr.on_request([sys0, user0, asst1, tool1])    # append: tool1（跳过 asst1）
+    compacted_user = ChatMessage(role="user", content="压缩后的新摘要任务")
+    tr.on_request([ChatMessage(role="system", content="改写后的系统提示"), compacted_user])
+
+    recs = [r for r in _read_records(trace.current_path()) if r.get("stream_id") == sid]
+    # 改写前没有守卫记录
+    pre = [r for r in recs if r["kind"] == "context_edited"]
+    assert len(pre) == 1, f"应恰好一条 context_edited，实得 {len(pre)}"
+    ce = pre[0]["payload"]
+    assert ce["diverged_at"] == 0 and ce["old_len"] == 4 and ce["new_len"] == 2, ce
+    assert len(ce["snapshot"]) == 2, "快照应含改写后的全部当前消息"
+    # 新内容不被静默丢失：可从快照恢复
+    assert any("压缩后的新摘要任务" in m["content"] for m in ce["snapshot"]), \
+        "压缩后的新消息应在快照里，未被增量逻辑漏掉"
+
+    # —— 纯截断：前缀一致但变短 → diverged_at = 新长度 ——
+    tr2 = trace.LLMTracer("fake", "fake-model")
+    sid2 = tr2.stream_id
+    tr2.on_request([sys0, user0, asst1, tool1])
+    tr2.on_request([sys0, user0])                 # 砍掉后两条，前缀不变
+    ce2 = [r for r in _read_records(trace.current_path())
+           if r.get("stream_id") == sid2 and r["kind"] == "context_edited"]
+    assert len(ce2) == 1 and ce2[0]["payload"]["diverged_at"] == 2, ce2
+    print("  case_append_only_guard OK")
+
+
 async def main() -> None:
-    for case in (case_lossless_recovery, case_injection_captured, case_hierarchy, case_replay):
+    for case in (case_lossless_recovery, case_injection_captured, case_hierarchy,
+                 case_replay, case_append_only_guard):
         with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp):
             trace.reset()
             trace.configure(dir=str(Path(tmp) / "traces"), enabled=True)
