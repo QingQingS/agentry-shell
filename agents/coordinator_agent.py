@@ -249,9 +249,11 @@ class CoordinatorAgent(AgentInterface):
     def _budget_header(self, task: str, rnd: int, ledger: dict) -> ChatMessage:
         """逐轮刷新的「健康度仪表盘」——临时消息，拼在请求末尾、不入持久 messages。
 
-        放三块：原始目标（锚定）+ 轮次预算（步2）+ 派发台账与止损（步3）。
+        放四块：原始目标（锚定）+ 轮次预算（步2）+ 派发台账与止损（步3）+ 进度自检（步4）。
         台账/止损读自 ledger（截至上一轮的派发结果），让 hub 在决定本轮动作前，
         看见「某条路已连续 N 次没结果」这个事实——该换思路或收尾，而不是闷头重试。
+        进度自检放在末尾（最贴近下一步决策），逐轮提醒 hub 对照原始目标，防止因不满意
+        上一个结果而不断派生更小更偏的子问题、一路漂离主线。
         used = 已完成轮数；left 含当前轮（rnd=0 时 left=MAX_ROUNDS）。
         """
         used, left = rnd, MAX_ROUNDS - rnd
@@ -272,6 +274,11 @@ class CoordinatorAgent(AgentInterface):
                         f"⚠️ 止损：{name} 已连续 {r['streak']} 次未拿到有效结果，"
                         "别再用同样方式重试——换思路（换问法/信息源/拆小问题），或停下来如实收尾。"
                     )
+        lines.append(
+            "进度自检：派下一个子任务前，对照上面的「原始目标」自问——这一步是否仍直接服务于它？"
+            "若你只是因对上一个结果不满意而不断派生更小、更偏的子问题，很可能已偏离主线："
+            "回到原始目标，或如实收尾，别越钻越细。"
+        )
         return ChatMessage(role="user", content="\n".join(lines))
 
     @staticmethod

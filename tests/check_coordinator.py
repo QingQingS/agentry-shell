@@ -248,6 +248,8 @@ async def main() -> None:
         assert "原始目标：测预算" in hs[0].content, hs[0].content
         # 剩余轮数随轮次递减：第 i 轮 已用 i / 剩余 MAX_ROUNDS-i
         assert f"已用 {i}，剩余 {MAX_ROUNDS - i}" in hs[0].content, hs[0].content
+        # 步4：drift 自检逐轮常驻（防漂离主线）
+        assert "进度自检" in hs[0].content, hs[0].content
     # 持久历史不含 header：FakeLLM 记录的是 messages+[header]，去掉末尾后不应再有 header
     assert headers(fake.turns[-1][:-1]) == [], "持久 messages 不应混入任何 header"
 
