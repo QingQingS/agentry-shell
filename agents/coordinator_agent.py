@@ -214,6 +214,15 @@ class CoordinatorAgent(AgentInterface):
                     metadata={"trace": "leaf", "spoke": label, "spoke_id": spoke_id},
                 )
 
+        status = "ok"
+        if not stopped_naturally:
+            # 触顶不再丢占位话术：强制一次「无工具」的诚实收尾，基于整段过程如实交代
+            # 做到哪/缺什么/为什么缺/试过哪些/下一步——与 spoke 的 incomplete 契约同构。
+            yield AgentEvent(type="log", content=f"达到派发轮上限（{MAX_ROUNDS}），强制诚实收尾。")
+            final_content = await self._honest_finish(llm, messages)
+            status = "incomplete"
+
+        # tokens 事件后置到收尾调用之后，使累计用量含这次诚实收尾的开销。
         usage = llm.cumulative_usage
         yield AgentEvent(
             type="tokens",
@@ -221,12 +230,38 @@ class CoordinatorAgent(AgentInterface):
             metadata={**usage.to_dict(), "provider": llm.provider_name, "model": llm.model},
         )
 
-        if not stopped_naturally:
-            yield AgentEvent(type="log", content=f"达到派发轮上限（{MAX_ROUNDS}），提前结束。")
-            final_content = final_content or "（因达派发轮上限提前结束，结果可能不完整。）"
-
         yield AgentEvent(
             type="result",
             content=final_content.strip(),
-            metadata={"spokes_used": spokes_used},
+            metadata={"spokes_used": spokes_used, "status": status},
+        )
+
+    FINISH_INSTRUCTION = (
+        "你已达到派发轮次上限，从现在起不能再调用任何工具或派发 agent。"
+        "请基于以上完整过程，给用户写一份诚实的收尾，不要用占位话术、不要编造未发生的结果：\n"
+        "1) 已完成什么——哪些子任务派出去了、各自拿回了什么实质结果（有 artifact 写明路径）。\n"
+        "2) 还缺什么——用户最初的要求里，哪一部分还没达成。\n"
+        "3) 为什么缺——卡在哪（如检索源离线/查无结果、轮次预算耗尽、某条路走不通）。\n"
+        "4) 试过哪些途径——避免接手者重复踩坑。\n"
+        "5) 下一步建议——若要继续，往哪个方向走最可能有进展。\n"
+        "用面向用户的 Markdown 正文，可长可短，但要让用户一眼看清「做到哪、缺什么、为什么」。"
+    )
+
+    async def _honest_finish(self, llm, messages: List[ChatMessage]) -> str:
+        """触顶后的诚实收尾：一次无工具 LLM 调用，强制据实交代进度与缺口。
+
+        无工具（tools=None）保证模型只能产出文本、无法再派发。收尾调用本身若失败，
+        回退到一句明确点出「触顶 + 看派发日志」的说明，绝不吞掉已有进展。
+        """
+        probe = messages + [ChatMessage(role="user", content=self.FINISH_INSTRUCTION)]
+        try:
+            resp = await llm.chat(probe)
+            text = (resp.content or "").strip()
+            if text:
+                return text
+        except Exception:  # noqa: BLE001 —— 收尾调用失败不该再掀翻整个 run
+            pass
+        return (
+            f"（已达派发轮上限（{MAX_ROUNDS}）提前结束，且自动收尾未能生成说明。"
+            "本次任务未完成，请查看上方各轮派发日志了解已派发的部分。）"
         )

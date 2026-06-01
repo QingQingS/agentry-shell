@@ -66,6 +66,23 @@ class FakeLLM(BaseLLM):
         return resp
 
 
+class CapHitLLM(FakeLLM):
+    """触顶场景：带工具时永远发 tool_call；诚实收尾探针（tools 为空）时返回进度文本。
+
+    Coordinator 触顶后会用 tools=None 再调一次 chat 强制据实收尾——这里据此分流。
+    """
+
+    def __init__(self):
+        super().__init__(script=[tool_resp(tc("dispatch_agent", agent="echo", prompt="loop"))])
+
+    async def chat(self, messages, *, temperature=None, max_tokens=None, tools=None, **kwargs):
+        if not tools:  # 诚实收尾探针：无工具 → 只能产出文本
+            self.turns.append(list(messages))
+            await self._record_usage(TokenUsage(input_tokens=1, output_tokens=1))
+            return text_resp("## 进度收尾\n已完成：派发了 echo。\n缺：未真正解决任务。\n原因：达派发轮上限。")
+        return await super().chat(messages, tools=tools, **kwargs)
+
+
 def echo_registry() -> AgentRegistry:
     return AgentRegistry([
         AgentSpec(
@@ -177,14 +194,15 @@ async def main() -> None:
         ("研究 A", ""), ("基于 A 做 B", "A 的蒸馏结论")
     ], ContextSpyAgent.received
 
-    # 5) MAX_ROUNDS 触顶：脚本永远发 tool_call
-    events = await collect(
-        [tool_resp(tc("dispatch_agent", agent="echo", prompt="loop"))],
-        registry=reg, task="无限派发",
-    )
+    # 5) MAX_ROUNDS 触顶：带工具时永远发 tool_call → 强制「无工具」诚实收尾。
+    #    收尾探针（tools=None）返回真实进度说明；result.content 取该说明、status=incomplete。
+    patch_llm(CapHitLLM())
+    agent = CoordinatorAgent(config=None)
+    events = [ev async for ev in agent.run("无限派发", registry=reg)]
     res = result_event(events)
-    assert res.content, "触顶也应有兜底 result"
-    # 触顶意味着 echo 被派发了 MAX_ROUNDS 次
+    assert res.content.startswith("## 进度收尾"), f"触顶应走诚实收尾，实得：{res.content!r}"
+    assert res.metadata.get("status") == "incomplete", res.metadata
+    # 触顶意味着 echo 被派发了 MAX_ROUNDS 次；诚实收尾不派发、不增计
     assert res.metadata.get("spokes_used") == ["echo"] * MAX_ROUNDS, res.metadata.get("spokes_used")
 
     # 8) 本地工具与 dispatch 混排：import_files → dispatch_agent(files=[...]) → text
