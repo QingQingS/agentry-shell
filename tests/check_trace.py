@@ -20,7 +20,9 @@ from pathlib import Path
 from typing import List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
+import replay  # noqa: E402  （scripts/replay.py）
 import core.trace as trace  # noqa: E402
 import agents.coordinator_agent as coord_module  # noqa: E402
 import agents.research_agent as research_module  # noqa: E402
@@ -212,8 +214,40 @@ async def case_hierarchy():
     print(f"  case_hierarchy OK（hub={hub_id}, spokes={leaf_runs}）")
 
 
+async def case_replay():
+    """replay 把 trace 还原成人读 transcript：hub→spoke 树状缩进 + 三样无损内容都在。"""
+    # 复用层级场景：hub 派一个 leaf
+    hub_traj = [
+        {"tool_calls": [ToolCall(id="d0", name="dispatch_agent",
+                                 arguments={"agent": "leaf", "prompt": "子任务 X"})]},
+        {"content": "## 汇总\n完成。"},
+    ]
+    coord_module.get_llm = lambda *a, **k: FakeLLM(hub_traj)
+    async for ev in run_agent(CoordinatorAgent(config=None), "顶层任务", registry=_leaf_registry()):
+        if ev.type == "status" and ev.content in ("done", "error"):
+            break
+
+    text = replay.render_tree(replay.load_records(trace.current_path()))
+
+    # 树状：hub 与 spoke 各有 run 头，且 spoke 缩进更深（挂在 hub 下）
+    hub_line = next(l for l in text.splitlines() if "agent=CoordinatorAgent" in l)
+    leaf_line = next(l for l in text.splitlines() if "agent=LeafAgent" in l)
+    indent = lambda s: len(s) - len(s.lstrip())
+    assert indent(leaf_line) > indent(hub_line), "spoke run 应缩进在 hub 之下"
+
+    # 无损内容在 transcript 里：hub 发给 spoke 的真实 prompt、spoke 的答复、汇总
+    assert "子任务 X" in text, "hub 发给 spoke 的真实 prompt 应出现"
+    assert "leaf 答复：子任务 X" in text, "spoke 的答复应出现"
+    assert "## 汇总" in text, "hub 末轮答复应出现"
+
+    # CLI 端到端：能选到最新文件并打印（不抛异常、有内容）
+    rc = replay.main([str(trace.current_path())])
+    assert rc == 0
+    print("  case_replay OK")
+
+
 async def main() -> None:
-    for case in (case_lossless_recovery, case_injection_captured, case_hierarchy):
+    for case in (case_lossless_recovery, case_injection_captured, case_hierarchy, case_replay):
         with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp):
             trace.reset()
             trace.configure(dir=str(Path(tmp) / "traces"), enabled=True)
