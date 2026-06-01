@@ -104,6 +104,25 @@ class ContextSpyAgent(AgentInterface):
         yield AgentEvent(type="result", content="done")
 
 
+class DegenerateAgent(AgentInterface):
+    """总返回 status=degenerate 的 spoke：用于验证 hub 的台账/止损。"""
+
+    name = "DegenerateAgent"
+
+    async def run(self, task, **kwargs):
+        yield AgentEvent(type="result", content="没查到",
+                         metadata={"status": "degenerate", "summary": "无结果"})
+
+
+def bad_registry() -> AgentRegistry:
+    return AgentRegistry([
+        AgentSpec(
+            name="bad", description="d", input_contract="i", output_contract="o",
+            factory=lambda config=None, websocket=None: DegenerateAgent(),
+        ),
+    ])
+
+
 def spy_registry() -> AgentRegistry:
     return AgentRegistry([
         AgentSpec(
@@ -231,6 +250,32 @@ async def main() -> None:
         assert f"已用 {i}，剩余 {MAX_ROUNDS - i}" in hs[0].content, hs[0].content
     # 持久历史不含 header：FakeLLM 记录的是 messages+[header]，去掉末尾后不应再有 header
     assert headers(fake.turns[-1][:-1]) == [], "持久 messages 不应混入任何 header"
+
+    # 10) 派发台账 + 止损（步3·问题1）：spoke 连续返回 degenerate → 仪表盘累计台账，
+    #     连续未成达阈值后亮止损提示（hub 据此该换思路/收尾，而非闷头重试）。
+    fake = FakeLLM([
+        tool_resp(tc("dispatch_agent", agent="bad", prompt="x")),
+        tool_resp(tc("dispatch_agent", agent="bad", prompt="x2")),
+        text_resp("## 收手"),
+    ])
+    patch_llm(fake)
+    agent = CoordinatorAgent(config=None)
+    _ = [ev async for ev in agent.run("测止损", registry=bad_registry())]
+
+    def hdr(turn):
+        return next(m for m in turn if (m.content or "").startswith("[任务健康度")).content
+
+    # 第0轮：尚未派发 → 无台账、无止损
+    h0 = hdr(fake.turns[0])
+    assert "派发台账" not in h0 and "⚠️ 止损" not in h0, h0
+    # 第1轮：1 次未成 → 台账出现，未到阈值（2）→ 无止损
+    h1 = hdr(fake.turns[1])
+    assert "bad：1 次（成 0 / 未成 1）" in h1, h1
+    assert "⚠️ 止损" not in h1, h1
+    # 第2轮：连续 2 次未成 → 触发止损
+    h2 = hdr(fake.turns[2])
+    assert "bad：2 次（成 0 / 未成 2）" in h2, h2
+    assert "⚠️ 止损：bad" in h2, h2
 
     # 8) 本地工具与 dispatch 混排：import_files → dispatch_agent(files=[...]) → text
     #    验证 import 不计入 spokes_used；本地工具 obs 正常回填；files 参数被 dispatch 接收。

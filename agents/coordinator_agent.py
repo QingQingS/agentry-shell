@@ -34,6 +34,7 @@ from core.staging import ImportFilesTool #tool
 from core.tools import ReadFileTool, ToolRegistry, WikiSearchTool #tool
 
 MAX_ROUNDS = 10          # Coordinator 派发轮上限（防递归式无限分解）
+STOP_LOSS_THRESHOLD = 2  # 某 spoke 连续多少次未拿到有效结果 → 在仪表盘亮止损提示
 DEFAULT_WIKI_ROOT = "wiki"   # 只读 wiki 检索的根（与 WikiAgent 落点一致）
 
 # spoke 内部事件里，向用户冒泡（扇入）的类型；status/result/error 不冒泡
@@ -112,6 +113,8 @@ class CoordinatorAgent(AgentInterface):
         ]
 
         spokes_used: List[str] = []
+        # 派发台账：agent 名 → {total, ok, bad, streak(连续未成)}；喂给仪表盘的止损判断。
+        ledger: dict = {}
         final_content = ""
         stopped_naturally = False
 
@@ -120,7 +123,7 @@ class CoordinatorAgent(AgentInterface):
             # 健康度仪表盘：逐轮变化的内容（预算余量…）必须放在**请求末尾**且**不写进
             # messages**——放开头/改 system 会把 KV cache 分歧点推到 token 0，整段 prompt
             # 每轮全 miss。末尾本就是未缓存的新内容区，搭车免费；不入历史则避免旧仪表盘累积。
-            resp = await llm.chat(messages + [self._budget_header(task, rnd)], tools=specs)
+            resp = await llm.chat(messages + [self._budget_header(task, rnd, ledger)], tools=specs)
             dt = time.monotonic() - t0
             messages.append(
                 ChatMessage(
@@ -208,8 +211,10 @@ class CoordinatorAgent(AgentInterface):
             observations = await driver
 
             for (call, kind, label, spoke_id), obs in zip(indexed, observations):
-                if kind == "dispatch" and not obs.startswith("Error:"):
-                    spokes_used.append(label)
+                if kind == "dispatch":
+                    self._ledger_record(ledger, label, self._obs_status(obs))
+                    if not obs.startswith("Error:"):
+                        spokes_used.append(label)
                 messages.append(ChatMessage(role="tool", content=obs, tool_call_id=call.id))
                 yield AgentEvent(
                     type="log",
@@ -241,22 +246,59 @@ class CoordinatorAgent(AgentInterface):
 
     HEALTH_TAG = "[任务健康度·实时]"
 
-    def _budget_header(self, task: str, rnd: int) -> ChatMessage:
+    def _budget_header(self, task: str, rnd: int, ledger: dict) -> ChatMessage:
         """逐轮刷新的「健康度仪表盘」——临时消息，拼在请求末尾、不入持久 messages。
 
-        本步（步2）只放两件事：原始目标（锚定，防后续跑偏）+ 轮次预算（让 hub 看见
-        自己还剩几步、为用户要求的后续环节留余地）。台账/drift 自检由后续步骤往这里加。
+        放三块：原始目标（锚定）+ 轮次预算（步2）+ 派发台账与止损（步3）。
+        台账/止损读自 ledger（截至上一轮的派发结果），让 hub 在决定本轮动作前，
+        看见「某条路已连续 N 次没结果」这个事实——该换思路或收尾，而不是闷头重试。
         used = 已完成轮数；left 含当前轮（rnd=0 时 left=MAX_ROUNDS）。
         """
         used, left = rnd, MAX_ROUNDS - rnd
-        content = (
-            f"{self.HEALTH_TAG}\n"
-            f"原始目标：{task}\n"
-            f"轮次预算：共 {MAX_ROUNDS} 轮，已用 {used}，剩余 {left}。\n"
+        lines = [
+            self.HEALTH_TAG,
+            f"原始目标：{task}",
+            f"轮次预算：共 {MAX_ROUNDS} 轮，已用 {used}，剩余 {left}。",
             "提醒：若用户要求里含后续环节（如归档/汇总），务必在剩余轮次里为它留出余地，"
-            "别把预算全用在前置调研上；预算见底时优先收尾交付，而不是再开新派发。"
-        )
-        return ChatMessage(role="user", content=content)
+            "别把预算全用在前置调研上；预算见底时优先收尾交付，而不是再开新派发。",
+        ]
+        if ledger:
+            lines.append("派发台账：")
+            for name, r in ledger.items():
+                lines.append(f"  - {name}：{r['total']} 次（成 {r['ok']} / 未成 {r['bad']}）")
+            for name, r in ledger.items():
+                if r["streak"] >= STOP_LOSS_THRESHOLD:
+                    lines.append(
+                        f"⚠️ 止损：{name} 已连续 {r['streak']} 次未拿到有效结果，"
+                        "别再用同样方式重试——换思路（换问法/信息源/拆小问题），或停下来如实收尾。"
+                    )
+        return ChatMessage(role="user", content="\n".join(lines))
+
+    @staticmethod
+    def _obs_status(obs: str) -> str:
+        """从一条 dispatch observation 解析 spoke 成色。
+
+        两种形态：`Error: …`（未知 agent / 派发异常）→ error；
+        `[<agent>] status=<s>\\n…`（正常 _format 输出）→ 取 <s>（ok/degenerate/incomplete/error）。
+        """
+        if obs.startswith("Error:"):
+            return "error"
+        first = obs.splitlines()[0] if obs else ""
+        if "status=" in first:
+            return first.split("status=", 1)[1].split()[0].strip() or "ok"
+        return "ok"
+
+    @staticmethod
+    def _ledger_record(ledger: dict, agent: str, status: str) -> None:
+        """记一笔派发结果；status=ok 清零连续未成 streak，否则 +1。"""
+        rec = ledger.setdefault(agent, {"total": 0, "ok": 0, "bad": 0, "streak": 0})
+        rec["total"] += 1
+        if status == "ok":
+            rec["ok"] += 1
+            rec["streak"] = 0
+        else:
+            rec["bad"] += 1
+            rec["streak"] += 1
 
     FINISH_INSTRUCTION = (
         "你已达到派发轮次上限，从现在起不能再调用任何工具或派发 agent。"
