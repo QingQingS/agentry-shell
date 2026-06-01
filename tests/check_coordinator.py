@@ -205,6 +205,33 @@ async def main() -> None:
     # 触顶意味着 echo 被派发了 MAX_ROUNDS 次；诚实收尾不派发、不增计
     assert res.metadata.get("spokes_used") == ["echo"] * MAX_ROUNDS, res.metadata.get("spokes_used")
 
+    # 9) 健康度仪表盘（步2·预算）：每轮请求末尾注入 header，含正确的剩余轮数；
+    #    header 不入持久历史（每次 chat 收到的 messages 里恰好 1 份 header，不累积）——
+    #    这是 KV cache 前缀命中的前提（前缀稳定、易变内容只在未缓存的尾部）。
+    fake = FakeLLM([
+        tool_resp(tc("dispatch_agent", agent="echo", prompt="a")),
+        tool_resp(tc("dispatch_agent", agent="echo", prompt="b")),
+        text_resp("## 完成"),
+    ])
+    patch_llm(fake)
+    agent = CoordinatorAgent(config=None)
+    _ = [ev async for ev in agent.run("测预算", registry=reg)]
+
+    def headers(msgs):
+        return [m for m in msgs if (m.content or "").startswith("[任务健康度")]
+
+    assert len(fake.turns) == 3, f"应 3 次 chat 调用，实得 {len(fake.turns)}"
+    for i, turn in enumerate(fake.turns):
+        hs = headers(turn)
+        assert len(hs) == 1, f"第{i}轮请求应恰含 1 份 header（不累积），实得 {len(hs)}"
+        assert turn[-1] is hs[0], f"第{i}轮 header 必须在请求末尾"
+        assert hs[0].role == "user", f"header 角色应为 user，实得 {hs[0].role}"
+        assert "原始目标：测预算" in hs[0].content, hs[0].content
+        # 剩余轮数随轮次递减：第 i 轮 已用 i / 剩余 MAX_ROUNDS-i
+        assert f"已用 {i}，剩余 {MAX_ROUNDS - i}" in hs[0].content, hs[0].content
+    # 持久历史不含 header：FakeLLM 记录的是 messages+[header]，去掉末尾后不应再有 header
+    assert headers(fake.turns[-1][:-1]) == [], "持久 messages 不应混入任何 header"
+
     # 8) 本地工具与 dispatch 混排：import_files → dispatch_agent(files=[...]) → text
     #    验证 import 不计入 spokes_used；本地工具 obs 正常回填；files 参数被 dispatch 接收。
     #    （staging 已降级为 wiki_curator 的 pre-hook，不再是 Coordinator 的工具——

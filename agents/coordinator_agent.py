@@ -117,7 +117,10 @@ class CoordinatorAgent(AgentInterface):
 
         for rnd in range(MAX_ROUNDS):
             t0 = time.monotonic()
-            resp = await llm.chat(messages, tools=specs)
+            # 健康度仪表盘：逐轮变化的内容（预算余量…）必须放在**请求末尾**且**不写进
+            # messages**——放开头/改 system 会把 KV cache 分歧点推到 token 0，整段 prompt
+            # 每轮全 miss。末尾本就是未缓存的新内容区，搭车免费；不入历史则避免旧仪表盘累积。
+            resp = await llm.chat(messages + [self._budget_header(task, rnd)], tools=specs)
             dt = time.monotonic() - t0
             messages.append(
                 ChatMessage(
@@ -235,6 +238,25 @@ class CoordinatorAgent(AgentInterface):
             content=final_content.strip(),
             metadata={"spokes_used": spokes_used, "status": status},
         )
+
+    HEALTH_TAG = "[任务健康度·实时]"
+
+    def _budget_header(self, task: str, rnd: int) -> ChatMessage:
+        """逐轮刷新的「健康度仪表盘」——临时消息，拼在请求末尾、不入持久 messages。
+
+        本步（步2）只放两件事：原始目标（锚定，防后续跑偏）+ 轮次预算（让 hub 看见
+        自己还剩几步、为用户要求的后续环节留余地）。台账/drift 自检由后续步骤往这里加。
+        used = 已完成轮数；left 含当前轮（rnd=0 时 left=MAX_ROUNDS）。
+        """
+        used, left = rnd, MAX_ROUNDS - rnd
+        content = (
+            f"{self.HEALTH_TAG}\n"
+            f"原始目标：{task}\n"
+            f"轮次预算：共 {MAX_ROUNDS} 轮，已用 {used}，剩余 {left}。\n"
+            "提醒：若用户要求里含后续环节（如归档/汇总），务必在剩余轮次里为它留出余地，"
+            "别把预算全用在前置调研上；预算见底时优先收尾交付，而不是再开新派发。"
+        )
+        return ChatMessage(role="user", content=content)
 
     FINISH_INSTRUCTION = (
         "你已达到派发轮次上限，从现在起不能再调用任何工具或派发 agent。"
