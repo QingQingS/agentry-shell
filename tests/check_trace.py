@@ -1,14 +1,15 @@
 """
-方案 1 · 步 1 验证：LLM 调用的无损增量追踪。
+LLM 调用追踪（全量快照）验证。
 
 证明的是「问题被解决」——此前永远无法复盘的三样东西，现在原样躺在落盘文件里：
   1. 每个 agent 实际用的完整 system prompt；
   2. LLM 原样输出的 tool_call 完整参数（尤其 save_report 那整篇报告——dispatch 只回截断预览）；
   3. LLM 实际收到的工具结果原文（检索条目，而非「N 条 / M 字」摘要）。
-并核对增量不重不漏：每条消息只出现一次，nudge 注入作为独立记录在位。
+并核对：日志层无状态（每条 request 是完整快照、末条即全量历史）、对「末尾逐轮变化的
+临时注入（健康度仪表盘）」如实落且不污染历史、读时窗口 + diff 正常。
 
 不发网络：FakeLLM 实现 provider 的真实扩展点 _chat_impl（故走 BaseLLM.chat 这一咽喉、
-触发 tap），驱动「真实的」ResearchAgent.run() 内部 ReAct 循环。
+触发 tap），驱动「真实的」ResearchAgent / Coordinator 内部 ReAct 循环。
 """
 
 import asyncio
@@ -85,6 +86,13 @@ def _read_records(path: Path) -> List[dict]:
     return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
 
 
+def _final_snapshot(recs: List[dict]) -> List[dict]:
+    """末条 request 快照——append-only 会话里它即「该会话的全量历史」。"""
+    requests = [r for r in recs if r["kind"] == "request"]
+    assert requests, "应至少有一条 request 快照"
+    return requests[-1]["payload"]["snapshot"]
+
+
 async def case_lossless_recovery():
     """一次真实 ReAct：search_papers → save_report(整篇) → 停。核对三样都被原样保留。"""
     results = [SearchResult(
@@ -106,14 +114,15 @@ async def case_lossless_recovery():
             break
 
     recs = _read_records(trace.current_path())
+    final = _final_snapshot(recs)
 
-    # —— 1. 完整 system prompt 被保留（此前完全不记录）——
-    sys_recs = [r for r in recs if r["kind"] == "msg" and r["payload"]["role"] == "system"]
-    assert len(sys_recs) == 1, f"system prompt 应恰好记一次，实得 {len(sys_recs)}"
+    # —— 1. 完整 system prompt 被保留（此前完全不记录），在末条快照里 ——
+    sys_msgs = [m for m in final if m["role"] == "system"]
+    assert len(sys_msgs) == 1, f"末条快照应含恰好一条 system，实得 {len(sys_msgs)}"
     expected_sys = SYSTEM_PROMPT_TEMPLATE.split("{today}")[0]
-    assert expected_sys[:60] in sys_recs[0]["payload"]["content"], "system prompt 应原样保留"
+    assert expected_sys[:60] in sys_msgs[0]["content"], "system prompt 应原样保留"
 
-    # —— 2. tool_call 完整参数：save_report 的整篇 content（dispatch 只回截断预览）——
+    # —— 2. tool_call 完整参数：save_report 的整篇 content（response 记录原样承载）——
     save_calls = [
         tc for r in recs if r["kind"] == "response"
         for tc in r["payload"].get("tool_calls", []) if tc["name"] == "save_report"
@@ -122,25 +131,23 @@ async def case_lossless_recovery():
     assert save_calls[0]["arguments"]["content"] == FULL_REPORT, \
         "save_report 的整篇报告参数应原样保留，而非摘要/截断"
 
-    # —— 3. 工具结果原文：检索条目全文（此前只记「N 条 / M 字」）——
-    tool_recs = [r for r in recs if r["kind"] == "msg" and r["payload"]["role"] == "tool"]
-    assert any(RESULT_FINGERPRINT in r["payload"]["content"] for r in tool_recs), \
-        "检索结果原文（含指纹）应原样保留在 tool 记录里"
+    # —— 3. 工具结果原文：检索条目全文（此前只记「N 条 / M 字」），在末条快照里 ——
+    tool_msgs = [m for m in final if m["role"] == "tool"]
+    assert any(RESULT_FINGERPRINT in m["content"] for m in tool_msgs), \
+        "检索结果原文（含指纹）应原样保留在快照的 tool 消息里"
 
-    # —— 增量不重不漏：assistant 答复只经 response 记录，不在输入尾巴里重复 ——
-    assert not any(r["kind"] == "msg" and r["payload"]["role"] == "assistant" for r in recs), \
-        "assistant 不该作为 msg 重复出现（已由 response 承载）"
+    # —— 日志层无状态：只有 request/response 两种 kind（无任何守卫/增量记录）——
+    assert all(r["kind"] in ("request", "response") for r in recs), \
+        f"应只有 request/response：{set(r['kind'] for r in recs)}"
+    # 同一实例 seq 单调唯一；每条都带 conv_id（会话可聚合）
     seqs = [r["seq"] for r in recs]
     assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs), "seq 应单调且唯一"
-    # 正常 append-only 流不该误触发步4 守卫
-    assert not any(r["kind"] == "context_edited" for r in recs), \
-        "append-only 流不应产生 context_edited"
+    assert all("conv_id" in r for r in recs), "每条记录都应带 conv_id"
     print(f"  case_lossless_recovery OK（{len(recs)} 条记录）")
 
 
 async def case_injection_captured():
-    """nudge 注入是一条新增 user 消息 → 应作为独立增量记录被捕获（不丢、不混入别处）。"""
-    # 同一 (search_papers, query) 连发 DUP_THRESHOLD 次触发 nudge 注入
+    """nudge 注入是一条新增 user 消息 → 应如实出现在后续 request 快照里。"""
     dup = ToolCall(id="c", name="search_papers", arguments={"query": "same"})
     smart_traj = (
         [{"tool_calls": [dup]}] * research_module.DUP_THRESHOLD
@@ -155,11 +162,69 @@ async def case_injection_captured():
             break
 
     recs = _read_records(trace.current_path())
-    user_texts = [r["payload"]["content"] for r in recs
-                  if r["kind"] == "msg" and r["payload"]["role"] == "user"]
+    final = _final_snapshot(recs)
+    user_texts = [m["content"] for m in final if m["role"] == "user"]
     assert any("似乎卡住了" in t for t in user_texts), \
-        f"nudge 注入应作为独立 user 记录被捕获：{user_texts}"
+        f"nudge 注入应如实出现在快照的 user 消息里：{user_texts}"
     print("  case_injection_captured OK")
+
+
+async def case_snapshot_no_state():
+    """全量快照 = 日志层无状态：镜像 Coordinator 的 `messages + [budget_header]`——
+    末尾逐轮变化、不入历史的健康度仪表盘，应被如实落、不误报、不污染历史；末条即全量。"""
+    sys0 = ChatMessage(role="system", content="系统提示")
+    user0 = ChatMessage(role="user", content="原始任务")
+
+    def bh(rnd: int) -> ChatMessage:   # 逐轮变化、不入持久 messages 的临时仪表盘
+        return ChatMessage(role="user", content=f"[健康度] 剩余 {3 - rnd} 轮")
+
+    asst1 = ChatMessage(role="assistant", content="决策1",
+                        tool_calls=[ToolCall(id="c1", name="dispatch_agent", arguments={})])
+    tool1 = ChatMessage(role="tool", content="子结果原文1", tool_call_id="c1")
+
+    tr = trace.LLMTracer("fake", "fake-model")
+    sid = tr.stream_id
+    tr.on_request([sys0, user0, bh(0)])                       # 轮0：历史[sys,user] + bh0
+    tr.on_request([sys0, user0, asst1, tool1, bh(1)])         # 轮1：历史增长 + bh1
+
+    recs = [r for r in _read_records(trace.current_path()) if r.get("stream_id") == sid]
+    # 无任何「守卫/误报」记录——只有 request
+    assert [r["kind"] for r in recs] == ["request", "request"], recs
+    final = recs[-1]["payload"]["snapshot"]
+    # 末条快照 = 全量历史：sys/user/assistant/tool + 当轮仪表盘，原样
+    assert [m["role"] for m in final] == ["system", "user", "assistant", "tool", "user"], final
+    assert final[0]["content"] == "系统提示"
+    assert final[-1]["content"] == "[健康度] 剩余 2 轮"
+    # 历史未被「上一轮仪表盘」污染：只有当轮 bh1，没有 bh0
+    contents = [m["content"] for m in final]
+    assert "[健康度] 剩余 3 轮" not in contents, "上一轮的临时仪表盘不该残留在历史里"
+    # 工具结果原文如实在快照里
+    assert any(m["role"] == "tool" and m["content"] == "子结果原文1" for m in final)
+    print("  case_snapshot_no_state OK")
+
+
+async def case_window_and_diff():
+    """读时窗口 + diff（纯函数）：长会话只展开最近 N 步；相邻快照不重复 system/历史。"""
+    def req(seq, msgs):
+        return {"seq": seq, "kind": "request", "run_id": "r1", "conv_id": "c1",
+                "agent": "A", "provider": "fake", "model": "m",
+                "payload": {"snapshot": [{"role": r, "content": c} for r, c in msgs]}}
+
+    records, msgs, seq = [], [("system", "SYS-唯一标记"), ("user", "U0")], 1
+    for k in range(7):                      # 7 步 append-only 会话
+        records.append(req(seq, list(msgs)))
+        seq += 1
+        msgs += [("assistant", f"A{k}"), ("user", f"T{k}")]
+
+    text = replay.render_tree(records, window=5)
+    assert "前 2 步已省略" in text, "7 步、窗口 5 应省略前 2 步"
+    assert text.count("SYS-唯一标记") == 1, "diff 后 system 只在窗口首个快照里出现一次，不重复"
+    assert "T5" in text, "最近一步（末条快照）的新增内容应在"
+
+    # 不限窗口时全展开，省略提示消失
+    full = replay.render_tree(records, window=0)
+    assert "已省略" not in full
+    print("  case_window_and_diff OK")
 
 
 class LeafAgent(AgentInterface):
@@ -183,7 +248,7 @@ def _leaf_registry() -> AgentRegistry:
 
 async def case_hierarchy():
     """hub→spoke 经 run_agent 这一咽喉成树：hub 无父；spoke 的 parent 指向 hub；
-    并发两个 spoke 各自独立 run_id，互不串味。"""
+    并发两个 spoke 各自独立 run_id（及各自 conv_id），互不串味。"""
     hub_traj = [
         {"tool_calls": [
             ToolCall(id="d0", name="dispatch_agent", arguments={"agent": "leaf", "prompt": "子任务 A"}),
@@ -198,7 +263,7 @@ async def case_hierarchy():
             break
 
     recs = _read_records(trace.current_path())
-    assert all("run_id" in r for r in recs), "步2 后每条记录都应带 run_id"
+    assert all("run_id" in r and "conv_id" in r for r in recs), "每条记录都应带 run_id 与 conv_id"
 
     hub_runs = {r["run_id"] for r in recs if r.get("agent") == "CoordinatorAgent"}
     leaf_runs = {r["run_id"] for r in recs if r.get("agent") == "LeafAgent"}
@@ -208,8 +273,11 @@ async def case_hierarchy():
     # hub 是根：无 parent
     assert all("parent_run_id" not in r for r in recs if r["run_id"] == hub_id), \
         "hub 记录不应有 parent_run_id"
-    # 两个并发 spoke：各自独立 run_id，且都挂在 hub 下
+    # 两个并发 spoke：各自独立 run_id，且都挂在 hub 下；conv_id 默认随 run → 与 hub 不同
     assert len(leaf_runs) == 2, f"两个并发 spoke 应有 2 个独立 run，实得 {leaf_runs}"
+    hub_convs = {r["conv_id"] for r in recs if r["run_id"] == hub_id}
+    leaf_convs = {r["conv_id"] for r in recs if r.get("agent") == "LeafAgent"}
+    assert hub_convs.isdisjoint(leaf_convs), "spoke 会话与 hub 会话应是不同的 conv_id"
     for r in recs:
         if r.get("agent") == "LeafAgent":
             assert r.get("parent_run_id") == hub_id, \
@@ -219,7 +287,6 @@ async def case_hierarchy():
 
 async def case_replay():
     """replay 把 trace 还原成人读 transcript：hub→spoke 树状缩进 + 三样无损内容都在。"""
-    # 复用层级场景：hub 派一个 leaf
     hub_traj = [
         {"tool_calls": [ToolCall(id="d0", name="dispatch_agent",
                                  arguments={"agent": "leaf", "prompt": "子任务 X"})]},
@@ -249,47 +316,9 @@ async def case_replay():
     print("  case_replay OK")
 
 
-async def case_append_only_guard():
-    """步4：前缀被改写/截断（未来上下文压缩）时落 context_edited + 快照，不静默丢数据。"""
-    sys0 = ChatMessage(role="system", content="原系统提示")
-    user0 = ChatMessage(role="user", content="原任务")
-    asst1 = ChatMessage(role="assistant", content="思考",
-                        tool_calls=[ToolCall(id="c1", name="search", arguments={"q": "x"})])
-    tool1 = ChatMessage(role="tool", content="检索结果原文", tool_call_id="c1")
-
-    # —— 改写：第三次请求时，前缀第 0 位 system 被换掉、整体压缩成 2 条 ——
-    tr = trace.LLMTracer("fake", "fake-model")
-    sid = tr.stream_id
-    tr.on_request([sys0, user0])                  # append: 2 条 msg
-    tr.on_request([sys0, user0, asst1, tool1])    # append: tool1（跳过 asst1）
-    compacted_user = ChatMessage(role="user", content="压缩后的新摘要任务")
-    tr.on_request([ChatMessage(role="system", content="改写后的系统提示"), compacted_user])
-
-    recs = [r for r in _read_records(trace.current_path()) if r.get("stream_id") == sid]
-    # 改写前没有守卫记录
-    pre = [r for r in recs if r["kind"] == "context_edited"]
-    assert len(pre) == 1, f"应恰好一条 context_edited，实得 {len(pre)}"
-    ce = pre[0]["payload"]
-    assert ce["diverged_at"] == 0 and ce["old_len"] == 4 and ce["new_len"] == 2, ce
-    assert len(ce["snapshot"]) == 2, "快照应含改写后的全部当前消息"
-    # 新内容不被静默丢失：可从快照恢复
-    assert any("压缩后的新摘要任务" in m["content"] for m in ce["snapshot"]), \
-        "压缩后的新消息应在快照里，未被增量逻辑漏掉"
-
-    # —— 纯截断：前缀一致但变短 → diverged_at = 新长度 ——
-    tr2 = trace.LLMTracer("fake", "fake-model")
-    sid2 = tr2.stream_id
-    tr2.on_request([sys0, user0, asst1, tool1])
-    tr2.on_request([sys0, user0])                 # 砍掉后两条，前缀不变
-    ce2 = [r for r in _read_records(trace.current_path())
-           if r.get("stream_id") == sid2 and r["kind"] == "context_edited"]
-    assert len(ce2) == 1 and ce2[0]["payload"]["diverged_at"] == 2, ce2
-    print("  case_append_only_guard OK")
-
-
 async def main() -> None:
-    for case in (case_lossless_recovery, case_injection_captured, case_hierarchy,
-                 case_replay, case_append_only_guard):
+    for case in (case_lossless_recovery, case_injection_captured, case_snapshot_no_state,
+                 case_window_and_diff, case_hierarchy, case_replay):
         with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp):
             trace.reset()
             trace.configure(dir=str(Path(tmp) / "traces"), enabled=True)

@@ -1,5 +1,5 @@
 """
-LLM 调用的无损增量追踪 —— 把每次 chat() 的完整输入增量与完整响应原样落盘。
+LLM 调用的无损追踪 —— 把每次 chat() 的完整输入快照与完整响应原样落盘。
 
 为什么存在（问题）：
     ReAct 的真实过程从未被完整保留——唯一的出口是为「显示」而生的有损事件流
@@ -7,18 +7,27 @@ LLM 调用的无损增量追踪 —— 把每次 chat() 的完整输入增量与
     prompt + LLM 原样输出含 tool_call 全参数 + 工具结果原文）一直只活在某次 run()
     的 messages 数组里，函数返回即销毁。本模块给它开一个独立于「显示」的「存档」出口。
 
-设计（方案 1 · 步 1）：
+设计（全量快照，写读分离）：
     - tap 在 BaseLLM.chat（所有 provider 之下、所有 agent 之上）→ 新 agent / 新
       provider 都自动被记，agent 自己零改动。
-    - 记「增量」而非「累加全量」：chat() 每次收到的是不断变长的完整对话，若每次落全量
-      会层层重复。故每次只落「输入尾巴里的非 assistant 消息」（seed / 工具结果原文 /
-      nudge 注入），assistant 答复另由 response 记录单独落 —— 二者不重不漏。
-        · 第 k 次返回的 assistant 答复，会在第 k+1 次作为输入尾巴再次出现 →
-          按 role==assistant 跳过，避免重复（它已由 response 记录承载）。
-        · 末轮答复没有「下一次输入」，但已由 response 记录落下 → 不遗漏。
-      按 seq 顺序把 msg + response 记录串起来，即可无损重建结束时的 messages 数组。
-    - 前提：当前 agent 循环对 messages「只增不改」。裁剪 / 压缩（README −72%）属
-      未来能力，到时由步 4 的 append-only 守卫把「历史被改写」也转成事件，此处不预设。
+    - 日志层是**无状态旁观者**：每次 chat 原样落「本次完整 input 快照 + 本次完整
+      output」，**完全不理解 input 里面是什么**（不区分历史 / 临时注入 / 是否被裁剪）。
+      → 与功能层彻底解耦：agent 怎么构造请求（如末尾搭车的健康度仪表盘）随便变，
+        日志层一行都不用改。LLM 调用本身无状态、每步自包含，记录层就镜像这种形态。
+    - 不再用「增量 + 跨调用基线」：那套需要假设 messages 只增不改，于是被迫处理
+      实例复用 / 临时注入 / 裁剪压缩等一堆破例（旧步4 的指纹守卫即为此而生）。改成
+      全量快照后，这些破例统统不构成问题——每条 request 记录独立自包含。
+        · 体积代价：单条会话内 request 快照是 O(n²) 冗余（每条含至此的全部历史）。
+          应对：response 全留（O(n)、是决策链核心）；request 快照交给 replay
+          **读时窗口**（只渲染最近若干个）+ **读时 diff**（相邻快照只显示新增尾巴）。
+          即「易变易错的逻辑放可重算的读路径，写路径只管最简最稳地如实落盘」。
+        · append-only 会话里，最新一条 request 快照即「全量历史」——replay 取末条
+          即可，无需重建。
+    - 归属标签（让记录可跟踪、可聚合）：每条记录带
+        run_id / parent_run_id / agent（步2：agent 运行层级，hub→spoke 派生树）
+        conv_id（会话层：同一条对话线程共享；默认「一个 run 一条会话」）。
+      conv_id 是 agent 声明的**身份标签**，日志层只是读环境贴上去——不解析 input，
+      故不构成与功能层的耦合。
     - 落盘：JSONL，一次进程 run 一个文件 <TRACE_DIR>/run-<ts>-<pid>.jsonl。
     - 默认开；TRACE=0 关，TRACE_DIR 改目录（默认 ./traces）。
 """
@@ -26,7 +35,6 @@ LLM 调用的无损增量追踪 —— 把每次 chat() 的完整输入增量与
 from __future__ import annotations
 
 import contextvars
-import hashlib
 import json
 import os
 import time
@@ -67,23 +75,20 @@ def _serialize_tool_call(tc: Any) -> dict:
     return {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
 
 
-def _fingerprint(m: Any) -> str:
-    """消息的稳定指纹，用于探测「已记录的前缀是否被改写/截断」（步4 守卫）。"""
-    blob = json.dumps(serialize_message(m), sort_keys=True, ensure_ascii=False)
-    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
-
-
-# ---- run 作用域（跨 agent 层级）---------------------------------------------
+# ---- run 作用域（跨 agent 层级 + 会话归属）---------------------------------
 # 每次 agent 运行（core.runner.run_agent）开一个 run：mint run_id，parent 取当前 run。
 # hub 入口和 dispatch 派发的 spoke 都经 run_agent，且 spoke 的 run_agent 跑在
 # asyncio.gather 复制出的隔离 context 里 → 父子归属天然成立、并发兄弟互不串味。
-# 每个 LLM 记录据此带上 run_id / parent_run_id / agent，replay 即可拼成树。
+# 同时 mint conv_id 作为「该 run 的默认会话」——绝大多数 agent「一个 run = 一条
+# 对话线程」，默认兜底即可正确聚合；将来「一个 run 内多条会话」（如 broad_survey 借
+# 同一实例开多次一次性对话）再引入显式会话作用域覆盖 conv_id。
 
 @dataclass
 class _RunCtx:
     run_id: str
     parent_run_id: Optional[str]
     agent: Optional[str]
+    conv_id: str
 
 
 _current_run: contextvars.ContextVar[Optional[_RunCtx]] = contextvars.ContextVar(
@@ -98,6 +103,7 @@ def enter_run(agent: Optional[str] = None) -> contextvars.Token:
         run_id=uuid.uuid4().hex[:8],
         parent_run_id=parent.run_id if parent is not None else None,
         agent=agent,
+        conv_id=uuid.uuid4().hex[:8],
     )
     return _current_run.set(ctx)
 
@@ -194,58 +200,27 @@ def current_path() -> Optional[Path]:
 # ---- per-LLM-instance tracer ------------------------------------------------
 
 class LLMTracer:
-    """每个 BaseLLM 实例持有一个，跨该实例的多次 chat() 维护增量高水位 hwm。
+    """每个 BaseLLM 实例持有一个：原样落「本次完整 input 快照」与「本次完整 output」。
 
-    一个对话 = 一个 provider 实例（agent 每次 run 各自 get_llm，互不共享）→
-    per-instance 状态即可正确切流；跨 agent 的父子归属留给步 2（contextvars）。
+    无状态旁观者——不跨调用维护任何「对话基线」，故实例被谁复用、input 怎么构造都
+    无所谓。stream_id 仅作「这些记录来自哪个 LLM 实例」的元数据；正确的会话聚合靠
+    conv_id（默认随 run）。
     """
 
     def __init__(self, provider: str, model: str) -> None:
         self.provider = provider
         self.model = model
         self.stream_id = uuid.uuid4().hex[:8]
-        self._hwm = 0           # 已记录到 messages 的哪个下标
-        self._seq = 0           # 该流内单调序号，供 replay 排序
-        self._fps: List[str] = []   # 已记录各位置的指纹，用于探测前缀被改写（步4）
+        self._seq = 0           # 该实例内单调序号，供 replay 排序
 
     def on_request(self, messages: List[Any]) -> None:
-        """落输入增量。正常（append-only）只落尾巴里的非 assistant 消息
-        （seed / 工具结果 / 注入）；assistant 答复由 on_response 承载，避免重复。
-
-        步4 守卫：若已记录的前缀被改写或截断（未来上下文压缩/裁剪），增量假设失效，
-        改落一条 context_edited 事件 + 全量 resync 快照——「历史被动过」本身留痕，
-        且文件仍能据快照无损重建当前上下文。replay 见到此记录即把基线切到 snapshot。"""
+        """落本次完整输入快照（原样、全量）。不理解 input 内部结构、不维护基线。"""
         if not _sink.enabled:
             return
-        n = len(messages)
-        diverged_at = self._find_divergence(messages, n)
-        if diverged_at is not None:
-            self._emit("context_edited", {
-                "diverged_at": diverged_at,
-                "old_len": self._hwm,
-                "new_len": n,
-                "snapshot": [serialize_message(m) for m in messages],
-            })
-        else:
-            for m in messages[self._hwm:]:
-                if m.role == "assistant":
-                    continue
-                self._emit("msg", serialize_message(m))
-        self._fps = [_fingerprint(m) for m in messages]
-        self._hwm = n
-
-    def _find_divergence(self, messages: List[Any], n: int) -> Optional[int]:
-        """返回前缀首个被改写的下标；纯截断（前缀一致但变短）返回新长度；否则 None。"""
-        limit = min(self._hwm, n)
-        for i in range(limit):
-            if _fingerprint(messages[i]) != self._fps[i]:
-                return i
-        if n < self._hwm:
-            return n
-        return None
+        self._emit("request", {"snapshot": [serialize_message(m) for m in messages]})
 
     def on_response(self, resp: Any, dt: float) -> None:
-        """落本次返回的完整响应（assistant 增量）。"""
+        """落本次返回的完整响应。"""
         if not _sink.enabled:
             return
         usage = getattr(resp, "usage", None)
@@ -267,15 +242,17 @@ class LLMTracer:
             "kind": kind,
             "payload": payload,
         }
-        # 跨 agent 层级：标注本条属于哪个 run、其父 run、哪个 agent（步 2）。
-        # stream_id 仍区分同一 run 内的多个 LLM 实例（如 researcher 的 smart 主循环
-        # 与 fast 的 broad_survey 子调用）。
+        # 归属标签：本条属于哪个 run、其父 run、哪个 agent（步2）+ 哪条会话（conv_id）。
+        # conv_id 默认随 run（一 run 一会话）；无 run 作用域时退回 stream_id（一实例一会话）。
         run = current_run()
         if run is not None:
             record["run_id"] = run.run_id
+            record["conv_id"] = run.conv_id
             if run.parent_run_id is not None:
                 record["parent_run_id"] = run.parent_run_id
             if run.agent is not None:
                 record["agent"] = run.agent
+        else:
+            record["conv_id"] = self.stream_id
         record.update({k: v for k, v in extra.items() if v is not None})
         _sink.emit(record)
