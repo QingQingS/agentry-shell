@@ -22,10 +22,15 @@ from typing import List
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import core.trace as trace  # noqa: E402
+import agents.coordinator_agent as coord_module  # noqa: E402
 import agents.research_agent as research_module  # noqa: E402
+from agents.coordinator_agent import CoordinatorAgent  # noqa: E402
 from agents.research_agent import ResearchAgent, SYSTEM_PROMPT_TEMPLATE  # noqa: E402
-from core.llm.base import BaseLLM, LLMResponse, ToolCall, TokenUsage  # noqa: E402
+from core.agent_interface import AgentEvent, AgentInterface  # noqa: E402
+from core.llm.base import BaseLLM, ChatMessage, LLMResponse, ToolCall, TokenUsage  # noqa: E402
+from core.registry import AgentRegistry, AgentSpec  # noqa: E402
 from core.retrievers.base import BaseRetriever, SearchResult  # noqa: E402
+from core.runner import run_agent  # noqa: E402
 
 
 class FakeLLM(BaseLLM):
@@ -152,8 +157,63 @@ async def case_injection_captured():
     print("  case_injection_captured OK")
 
 
+class LeafAgent(AgentInterface):
+    """最小 spoke：调一次 LLM 后给 result。每个实例自带 FakeLLM（并发隔离）。"""
+
+    name = "LeafAgent"
+
+    async def run(self, task, **kwargs):
+        llm = FakeLLM([{"content": f"leaf 答复：{task}"}])
+        resp = await llm.chat([ChatMessage(role="user", content=task)])
+        yield AgentEvent(type="result", content=resp.content,
+                         metadata={"status": "ok", "summary": "leaf done"})
+
+
+def _leaf_registry() -> AgentRegistry:
+    return AgentRegistry([AgentSpec(
+        name="leaf", description="d", input_contract="i", output_contract="o",
+        factory=lambda config=None, websocket=None: LeafAgent(),
+    )])
+
+
+async def case_hierarchy():
+    """hub→spoke 经 run_agent 这一咽喉成树：hub 无父；spoke 的 parent 指向 hub；
+    并发两个 spoke 各自独立 run_id，互不串味。"""
+    hub_traj = [
+        {"tool_calls": [
+            ToolCall(id="d0", name="dispatch_agent", arguments={"agent": "leaf", "prompt": "子任务 A"}),
+            ToolCall(id="d1", name="dispatch_agent", arguments={"agent": "leaf", "prompt": "子任务 B"}),
+        ]},
+        {"content": "## 汇总\n两路都完成。"},
+    ]
+    coord_module.get_llm = lambda *a, **k: FakeLLM(hub_traj)
+
+    async for ev in run_agent(CoordinatorAgent(config=None), "顶层任务", registry=_leaf_registry()):
+        if ev.type == "status" and ev.content in ("done", "error"):
+            break
+
+    recs = _read_records(trace.current_path())
+    assert all("run_id" in r for r in recs), "步2 后每条记录都应带 run_id"
+
+    hub_runs = {r["run_id"] for r in recs if r.get("agent") == "CoordinatorAgent"}
+    leaf_runs = {r["run_id"] for r in recs if r.get("agent") == "LeafAgent"}
+    assert len(hub_runs) == 1, f"hub 应恰好一个 run，实得 {hub_runs}"
+    hub_id = next(iter(hub_runs))
+
+    # hub 是根：无 parent
+    assert all("parent_run_id" not in r for r in recs if r["run_id"] == hub_id), \
+        "hub 记录不应有 parent_run_id"
+    # 两个并发 spoke：各自独立 run_id，且都挂在 hub 下
+    assert len(leaf_runs) == 2, f"两个并发 spoke 应有 2 个独立 run，实得 {leaf_runs}"
+    for r in recs:
+        if r.get("agent") == "LeafAgent":
+            assert r.get("parent_run_id") == hub_id, \
+                f"spoke 的 parent 应指向 hub：{r.get('parent_run_id')} != {hub_id}"
+    print(f"  case_hierarchy OK（hub={hub_id}, spokes={leaf_runs}）")
+
+
 async def main() -> None:
-    for case in (case_lossless_recovery, case_injection_captured):
+    for case in (case_lossless_recovery, case_injection_captured, case_hierarchy):
         with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp):
             trace.reset()
             trace.configure(dir=str(Path(tmp) / "traces"), enabled=True)

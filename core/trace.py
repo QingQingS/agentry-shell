@@ -25,10 +25,12 @@ LLM 调用的无损增量追踪 —— 把每次 chat() 的完整输入增量与
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -62,6 +64,47 @@ def serialize_response(resp: Any) -> dict:
 
 def _serialize_tool_call(tc: Any) -> dict:
     return {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+
+
+# ---- run 作用域（跨 agent 层级）---------------------------------------------
+# 每次 agent 运行（core.runner.run_agent）开一个 run：mint run_id，parent 取当前 run。
+# hub 入口和 dispatch 派发的 spoke 都经 run_agent，且 spoke 的 run_agent 跑在
+# asyncio.gather 复制出的隔离 context 里 → 父子归属天然成立、并发兄弟互不串味。
+# 每个 LLM 记录据此带上 run_id / parent_run_id / agent，replay 即可拼成树。
+
+@dataclass
+class _RunCtx:
+    run_id: str
+    parent_run_id: Optional[str]
+    agent: Optional[str]
+
+
+_current_run: contextvars.ContextVar[Optional[_RunCtx]] = contextvars.ContextVar(
+    "trace_current_run", default=None
+)
+
+
+def enter_run(agent: Optional[str] = None) -> contextvars.Token:
+    """开一个 run 作用域，返回 token（交给 exit_run 还原）。"""
+    parent = _current_run.get()
+    ctx = _RunCtx(
+        run_id=uuid.uuid4().hex[:8],
+        parent_run_id=parent.run_id if parent is not None else None,
+        agent=agent,
+    )
+    return _current_run.set(ctx)
+
+
+def exit_run(token: contextvars.Token) -> None:
+    """还原到父作用域；token 跨 context 失效时静默忽略（异步生成器提前关闭等边界）。"""
+    try:
+        _current_run.reset(token)
+    except (ValueError, LookupError):
+        pass
+
+
+def current_run() -> Optional[_RunCtx]:
+    return _current_run.get()
 
 
 # ---- 进程级 sink ------------------------------------------------------------
@@ -190,5 +233,15 @@ class LLMTracer:
             "kind": kind,
             "payload": payload,
         }
+        # 跨 agent 层级：标注本条属于哪个 run、其父 run、哪个 agent（步 2）。
+        # stream_id 仍区分同一 run 内的多个 LLM 实例（如 researcher 的 smart 主循环
+        # 与 fast 的 broad_survey 子调用）。
+        run = current_run()
+        if run is not None:
+            record["run_id"] = run.run_id
+            if run.parent_run_id is not None:
+                record["parent_run_id"] = run.parent_run_id
+            if run.agent is not None:
+                record["agent"] = run.agent
         record.update({k: v for k, v in extra.items() if v is not None})
         _sink.emit(record)
