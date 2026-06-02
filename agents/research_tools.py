@@ -29,6 +29,7 @@ from typing import List, Optional, Tuple
 from core.llm import ChatMessage
 from core.llm.base import ToolSpec
 from core.retrievers import BaseRetriever, SearchResult
+from core.scope import Scope, ScopeViolation
 from core.tools import Tool, ToolRegistry
 
 
@@ -278,9 +279,9 @@ class SaveReportTool(Tool):
     wiki/staging/，再派 wiki_curator。
 
     保护：
-    - filename 必须以 .md 结尾，且不含路径分隔（/ \\）或 ..
-    - 同名冲突自动追加时间戳后缀
-    - 父目录自动创建
+    - 落盘范围声明式收敛到 Scope（可写、仅 .md、限定 reports 根内防越界）。
+    - filename 须是不含目录的纯文件名（save_report 的产品约定）。
+    - 同名冲突自动追加时间戳后缀；父目录自动创建。
     """
 
     DEFAULT_ROOT = "reports"
@@ -304,23 +305,24 @@ class SaveReportTool(Tool):
     )
 
     def __init__(self, root: Optional[Path] = None):
-        self.root = (Path(root) if root else Path(self.DEFAULT_ROOT)).resolve()
+        root = Path(root) if root else Path(self.DEFAULT_ROOT)
+        self.scope = Scope(root=root, writable=True, allowed_suffixes=frozenset({".md"}))
 
     async def execute(self, filename: str, content: str) -> str:
         if not filename:
             return "Error: filename 不能为空"
-        if "/" in filename or "\\" in filename or ".." in filename:
-            return f"Error: filename 不允许包含路径分隔或 ..: {filename}"
-        if not filename.endswith(".md"):
-            return f"Error: filename 必须以 .md 结尾: {filename}"
-        self.root.mkdir(parents=True, exist_ok=True)
-        target = self.root / filename
+        if "/" in filename or "\\" in filename:
+            return f"Error: filename 须是不含目录的纯文件名: {filename}"
+        try:
+            target = self.scope.resolve(filename, for_write=True)  # .md 白名单 + 越界(如 ..)交给 Scope
+        except ScopeViolation as e:
+            return f"Error: {e}"
+        self.scope.root.mkdir(parents=True, exist_ok=True)
         if target.exists():
             ts = time.strftime("%Y%m%d-%H%M%S")
-            target = self.root / f"{target.stem}-{ts}.md"
+            target = target.with_name(f"{target.stem}-{ts}.md")
         target.write_text(content, encoding="utf-8")
-        display = self._display_path(target)
-        return f"已保存 {display}（{len(content)} 字符）"
+        return f"已保存 {self._display_path(target)}（{len(content)} 字符）"
 
     @staticmethod
     def _display_path(p: Path) -> str:

@@ -33,10 +33,10 @@ from pathlib import Path
 from typing import List, Optional
 
 from core.llm.base import ToolSpec
-from core.tools import Tool
+from core.scope import Scope, ScopeViolation
+from core.tools import STAGING_MAX_BYTES, STAGING_SUFFIXES, Tool
 
-MAX_BYTES = 1024 * 1024  # 1 MiB —— 与 ReadSourceTool 对齐
-ALLOWED_SUFFIXES = {".md", ".markdown", ".txt", ".rst"}
+# 后缀白名单 / 大小上限的唯一真源在 core/tools.py（read_source 也用），此处复用避免漂移。
 
 
 def _ts_suffix() -> str:
@@ -89,12 +89,20 @@ class ImportFilesTool(Tool):
 
     def __init__(self, uploads_root: Optional[Path] = None):
         root = Path(uploads_root) if uploads_root else Path(self.DEFAULT_UPLOADS)
-        self.root = root.resolve()
+        # 入库范围声明式收敛到 Scope：可写、文本后缀白名单、单文件大小上限。
+        # 源是外部 path（本工具是唯一的外部入口），故源的存在/大小仍对 src 直接判，
+        # 但「能不能进 uploads / 什么后缀」交给 Scope 统一裁决。
+        self.scope = Scope(
+            root=root,
+            writable=True,
+            allowed_suffixes=STAGING_SUFFIXES,
+            max_bytes=STAGING_MAX_BYTES,
+        )
 
     async def execute(self, paths: List[str]) -> str:
         if not paths:
             return "Error: paths 不能为空"
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.scope.root.mkdir(parents=True, exist_ok=True)
         lines: List[str] = []
         for raw in paths:
             try:
@@ -105,15 +113,16 @@ class ImportFilesTool(Tool):
             if not src.is_file():
                 lines.append(f"✗ {raw}: 文件不存在")
                 continue
-            if src.suffix.lower() not in ALLOWED_SUFFIXES:
-                allowed = ", ".join(sorted(ALLOWED_SUFFIXES))
-                lines.append(f"✗ {raw}: 后缀不在白名单（{allowed}）")
+            try:
+                dest = self.scope.resolve(src.name, for_write=True)  # 后缀白名单 + 可写性
+            except ScopeViolation as e:
+                lines.append(f"✗ {raw}: {e.reason}")
                 continue
             size = src.stat().st_size
-            if size > MAX_BYTES:
-                lines.append(f"✗ {raw}: {size} 字节超过上限 {MAX_BYTES}")
+            if not self.scope.within_size(size):
+                lines.append(f"✗ {raw}: {size} 字节超过上限 {self.scope.max_bytes}")
                 continue
-            target = _resolve_with_conflict(self.root / src.name)
+            target = _resolve_with_conflict(dest)
             shutil.copy2(src, target)
             lines.append(f"✓ {raw} → {_display(target)}")
         return "\n".join(lines)
@@ -167,8 +176,8 @@ def stage_one(
     if not resolved.is_file():
         raise StageError(f"源不存在：{src}")
     size = resolved.stat().st_size
-    if size > MAX_BYTES:
-        raise StageError(f"{src}: {size} 字节超过上限 {MAX_BYTES}")
+    if size > STAGING_MAX_BYTES:
+        raise StageError(f"{src}: {size} 字节超过上限 {STAGING_MAX_BYTES}")
 
     staging_root.mkdir(parents=True, exist_ok=True)
     dest = staging_root / src.replace("/", "__")
