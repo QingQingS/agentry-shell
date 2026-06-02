@@ -31,6 +31,7 @@ from core.dispatch import DispatchAgentTool #tool
 from core.llm import ChatMessage, get_llm
 from core.registry import AgentRegistry, build_default_registry
 from core.staging import ImportFilesTool #tool
+from core.scope import Scope
 from core.tools import ReadFileTool, ToolRegistry, WikiSearchTool #tool
 
 MAX_ROUNDS = 10          # Coordinator 派发轮上限（防递归式无限分解）
@@ -61,14 +62,15 @@ SCHEMA_TEMPLATE = """你是一个任务编排中枢（Coordinator）。你把用
   **下游 spoke 永远不直接读外部 path**——任何外部文件必须先经 import_files 进入工作区。
 
 - wiki_search(query): 在已归档的本地 wiki 里按关键词检索已有页面（只读）。
-  返回命中页面的 path/标题/片段。回答问题前可先查 wiki 复用已沉淀的知识；
-  只命中已策展页面（不含 staging/）。
-- read_file(path): 读取某个 wiki 页面的完整内容（path 相对 wiki 根，如 AI/rag.md）。
-  配合 wiki_search 使用：先搜到 path，再读全文，然后在答复里引用。
+  返回命中页面的 path（相对项目根，如 wiki/AI/rag.md）/标题/片段。回答问题前可先查 wiki
+  复用已沉淀的知识；只命中已策展页面（不含 staging/）。
+- read_file(path): 读取工作区内某个文件的完整内容（只读，path 相对项目根，如 reports/xxx.md）。
+  可读 researcher 落盘的 reports/，也可读 wiki_search 命中的页面（把它返回的 path 直接传入即可）。
 
 跨 agent 数据流的标准模式：
 
 - 调研任务：dispatch_agent(researcher, ...) → 拿到 artifact: reports/xxx.md（researcher 强制落盘）。
+  纯调研、不归档时，可 read_file("reports/xxx.md") 读全文综合给用户。
 - 归档 researcher 的产出：dispatch_agent(wiki_curator, prompt="把这篇归档进 wiki，按主题归类",
   files=["reports/xxx.md"])。文件搬运由系统在派发时完成，你不必（也无法）自己搬。
 - 归档用户提供的外部文件：import_files([...]) → dispatch_agent(wiki_curator,
@@ -93,10 +95,25 @@ class CoordinatorAgent(AgentInterface):
         registry: AgentRegistry = kwargs.get("registry") or build_default_registry()
         dispatch = DispatchAgentTool(registry, config=self.config, websocket=self.websocket)
         import_tool = ImportFilesTool()
-        # 只读 wiki 检索：闭合 research→curate→reuse 的 reuse 一环（命中已归档页面并引用）。
+        # Coordinator 的文件权限：read_file 看整个项目（只读），既能 reuse 已归档 wiki 页面，
+        # 也能直接读 researcher 落盘的 reports/xxx.md 做综合（纯调研、不归档时尤其需要）。
+        # wiki_search 的检索/读取边界仍只在 wiki（不被放开）。
+        project_root = Path(kwargs.get("project_root") or ".").resolve()
         wiki_root = Path(kwargs.get("wiki_root") or DEFAULT_WIKI_ROOT)
-        wiki_search = WikiSearchTool(wiki_root.resolve())
-        wiki_read = ReadFileTool(wiki_root.resolve())
+        if not wiki_root.is_absolute():
+            wiki_root = project_root / wiki_root
+        wiki_root = wiki_root.resolve()
+        # wiki_search 命中 path 原是 wiki 根相对；补成项目相对（如 wiki/AI/rag.md），
+        # 与 read_file 的项目根口径一致，reuse→read_file 才接得上。wiki 不在项目内则退回空前缀。
+        try:
+            wiki_prefix = wiki_root.relative_to(project_root).as_posix() + "/"
+        except ValueError:
+            wiki_prefix = ""
+        wiki_search = WikiSearchTool(Scope(root=wiki_root), path_prefix=wiki_prefix)
+        wiki_read = ReadFileTool(
+            Scope(root=project_root),
+            description="读取工作区内某个文件的完整内容（只读）。path 相对项目根，如 reports/xxx.md。",
+        )
         tools = ToolRegistry([dispatch, import_tool, wiki_search, wiki_read])
         specs = tools.specs()
 
